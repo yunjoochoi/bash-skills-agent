@@ -188,6 +188,14 @@ def generate_prompts(work_dir):
     analysis_path = os.path.join(work_dir, "analysis.json")
     edits_path = os.path.join(work_dir, "edits.json")
 
+    if not os.path.isfile(edits_path):
+        print(
+            f"Warning: {edits_path} not found. "
+            "Run this AFTER writing edits.json (Step 3.5).",
+            file=sys.stderr,
+        )
+        return {"prompts": []}
+
     with open(analysis_path, "r", encoding="utf-8") as f:
         analysis = json.load(f)
 
@@ -208,7 +216,7 @@ def generate_prompts(work_dir):
         if action not in ("replace", "insert_after", "insert_before"):
             continue
 
-        # Skip table-level and TOC edits
+        # Skip table-level edits
         edit_unit = edit.get("edit_unit")
         if edit_unit in ("table", "row", "column"):
             continue

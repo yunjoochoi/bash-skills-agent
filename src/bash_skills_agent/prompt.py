@@ -35,7 +35,6 @@ Use `read_skill(skill_name)` to load detailed instructions before proceeding.
 
 - Always `read_file` before editing. Use `edit_file` for targeted modifications — NEVER write scripts to parse/modify structured files.
 - For large files, use `grep_search` to locate the relevant section first, then `read_file` with offset/limit to read only that area.
-- When editing existing documents, follow the skill's workflow exactly. Do NOT recreate from scratch.
 - For multi-step tasks, create a todo list with `todo_write` first.
 - Prefer file tools over code execution for file operations.
 - Skills are loaded via `read_skill` — follow their instructions exactly.

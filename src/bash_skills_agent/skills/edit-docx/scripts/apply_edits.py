@@ -187,8 +187,6 @@ def generate_new_blocks(edits, analysis):
                 "edit_unit": edit_unit,
                 "row_style_aliases": None,
                 "cell_style_aliases": None,
-                "toc_level_alias": edit.get("toc_level_alias"),
-                "anchor_block_id": None,
             }
             new_blocks.append(nb)
             continue
@@ -212,25 +210,6 @@ def generate_new_blocks(edits, analysis):
                     "edit_unit": edit_unit,
                     "row_style_aliases": edit.get("row_style_aliases"),
                     "cell_style_aliases": edit.get("cell_style_aliases"),
-                    "toc_level_alias": None,
-                    "anchor_block_id": None,
-                }
-                new_blocks.append(nb)
-                continue
-
-            # TOC inserts: pass through toc_level_alias
-            if semantic_tag == "TOC":
-                nb = {
-                    "action": action,
-                    "target_id": target_id,
-                    "style_key": "",
-                    "content": new_text or "",
-                    "run_xmls": [],
-                    "edit_unit": None,
-                    "row_style_aliases": None,
-                    "cell_style_aliases": None,
-                    "toc_level_alias": edit.get("toc_level_alias"),
-                    "anchor_block_id": edit.get("anchor_block_id"),
                 }
                 new_blocks.append(nb)
                 continue
@@ -265,31 +244,12 @@ def generate_new_blocks(edits, analysis):
                 "edit_unit": None,
                 "row_style_aliases": None,
                 "cell_style_aliases": None,
-                "toc_level_alias": None,
-                "anchor_block_id": None,
             }
             new_blocks.append(nb)
             continue
 
         # ----- REPLACE -----
         if action == "replace":
-            # TOC replace
-            if semantic_tag == "TOC":
-                nb = {
-                    "action": "replace",
-                    "target_id": target_id,
-                    "style_key": "",
-                    "content": new_text or "",
-                    "run_xmls": [],
-                    "edit_unit": None,
-                    "row_style_aliases": edit.get("row_style_aliases"),
-                    "cell_style_aliases": edit.get("cell_style_aliases"),
-                    "toc_level_alias": edit.get("toc_level_alias"),
-                    "anchor_block_id": edit.get("anchor_block_id"),
-                }
-                new_blocks.append(nb)
-                continue
-
             # Table replace: pass through as-is
             if semantic_tag == "TBL" or edit_unit:
                 style_key = ""
@@ -306,8 +266,6 @@ def generate_new_blocks(edits, analysis):
                     "edit_unit": edit_unit,
                     "row_style_aliases": edit.get("row_style_aliases"),
                     "cell_style_aliases": edit.get("cell_style_aliases"),
-                    "toc_level_alias": None,
-                    "anchor_block_id": None,
                 }
                 new_blocks.append(nb)
                 continue
@@ -355,8 +313,6 @@ def generate_new_blocks(edits, analysis):
                 "edit_unit": edit_unit,
                 "row_style_aliases": edit.get("row_style_aliases"),
                 "cell_style_aliases": edit.get("cell_style_aliases"),
-                "toc_level_alias": None,
-                "anchor_block_id": None,
             }
             new_blocks.append(nb)
 
@@ -476,8 +432,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 "original_target_id": nb["target_id"],
                 "edit_unit": nb.get("edit_unit"),
                 "run_xmls": list(nb.get("run_xmls") or []),
-                "toc_level_alias": nb.get("toc_level_alias"),
-                "anchor_block_id": nb.get("anchor_block_id"),
                 "row_style_aliases": nb.get("row_style_aliases"),
                 "cell_style_aliases": nb.get("cell_style_aliases"),
             })
@@ -539,8 +493,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 insert_list.append({
                     "para_idx": p_idx,
                     "content": nb.get("content", ""),
-                    "toc_level_alias": nb.get("toc_level_alias"),
-                    "anchor_block_id": nb.get("anchor_block_id"),
                     "insert_after": True,
                     "_insert_order": len(insert_list),
                 })
@@ -594,8 +546,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 insert_list.append({
                     "para_idx": p_idx,
                     "content": nb.get("content", ""),
-                    "toc_level_alias": nb.get("toc_level_alias"),
-                    "anchor_block_id": nb.get("anchor_block_id"),
                     "insert_after": False,
                     "_insert_order": len(insert_list),
                 })
@@ -1700,411 +1650,11 @@ def _build_table_from_template(template, content,
 
 
 # -------------------------------------------------------------------
-# TOC operations
-# -------------------------------------------------------------------
-
-def _toc_replace_entry(sdt_xml, p_idx, new_text,
-                       toc_level_alias=None, anchor_name=None):
-    """Replace a specific entry in an SDT (TOC) block.
-
-    Preserves hyperlink structure; updates number, title, page.
-
-    Args:
-        sdt_xml: SDT XML string.
-        p_idx: Paragraph index within sdtContent (0-based).
-        new_text: New entry text ('number title | page' format).
-        toc_level_alias: TL alias (unused in in-place update).
-        anchor_name: Bookmark anchor name for hyperlink.
-
-    Returns:
-        Modified SDT XML string.
-    """
-    try:
-        root = ET.fromstring(sdt_xml)
-        sdt_content = root.find("w:sdtContent", NAMESPACES)
-        if sdt_content is None:
-            return sdt_xml
-
-        paragraphs = sdt_content.findall("w:p", NAMESPACES)
-        if p_idx >= len(paragraphs):
-            return sdt_xml
-
-        target_para = paragraphs[p_idx]
-
-        # Parse new_text
-        parts = new_text.split("|")
-        text_part = parts[0].strip()
-        page_num = parts[1].strip() if len(parts) > 1 else ""
-
-        match = re.match(r"^([\d\-]+\.?)\s*(.*)$", text_part)
-        number = match.group(1) if match else ""
-        title = match.group(2) if match else text_part
-
-        anchor = anchor_name or f"_Toc{p_idx:08d}"
-
-        hyperlinks = target_para.findall(".//w:hyperlink", NAMESPACES)
-        if hyperlinks:
-            _update_toc_hyperlinks(
-                target_para, hyperlinks, number, title, page_num, anchor,
-            )
-        else:
-            _update_toc_simple(target_para, number, title, page_num)
-
-        return ET.tostring(root, encoding="unicode")
-
-    except ET.ParseError:
-        return sdt_xml
-
-
-def _toc_insert_entry(sdt_xml, p_idx, new_text,
-                      toc_level_alias=None, insert_after=True,
-                      anchor_name=None, toc_style_templates=None):
-    """Insert a new TOC entry using clone-first strategy.
-
-    Clones an existing paragraph of the same level, then updates text.
-
-    Args:
-        sdt_xml: SDT XML string.
-        p_idx: Reference paragraph index (0-based).
-        new_text: Entry text ('number title | page' format).
-        toc_level_alias: TL alias for level matching.
-        insert_after: True = insert after, False = before.
-        anchor_name: Bookmark anchor name.
-        toc_style_templates: TL alias -> template dict.
-
-    Returns:
-        Modified SDT XML string.
-    """
-    toc_style_templates = toc_style_templates or {}
-
-    try:
-        root = ET.fromstring(sdt_xml)
-        sdt_content = root.find("w:sdtContent", NAMESPACES)
-        if sdt_content is None:
-            return sdt_xml
-
-        paragraphs = sdt_content.findall("w:p", NAMESPACES)
-        if p_idx >= len(paragraphs):
-            return sdt_xml
-
-        # Parse new_text
-        parts = new_text.split("|")
-        text_part = parts[0].strip()
-        page_num = parts[1].strip() if len(parts) > 1 else ""
-
-        match = re.match(r"^([\d\-]+\.?)\s*(.*)$", text_part)
-        number = match.group(1) if match else ""
-        title = match.group(2) if match else text_part
-
-        effective_anchor = anchor_name or f"_Toc{p_idx:08d}"
-
-        # Clone-first: find same-level paragraph to clone
-        clone_source = None
-        if toc_level_alias and toc_level_alias in toc_style_templates:
-            target_tpl = toc_style_templates[toc_level_alias]
-            clone_source = _find_toc_paragraph_by_level(
-                paragraphs, target_tpl,
-            )
-
-        if clone_source is None:
-            clone_source = paragraphs[p_idx]
-
-        new_para = copy.deepcopy(clone_source)
-
-        # Update text in cloned paragraph
-        hyperlinks = new_para.findall(".//w:hyperlink", NAMESPACES)
-        if hyperlinks:
-            _update_toc_hyperlinks(
-                new_para, hyperlinks, number, title, page_num,
-                effective_anchor,
-            )
-        else:
-            _update_toc_simple(new_para, number, title, page_num)
-
-        # Insert at correct position
-        ref_para = paragraphs[p_idx]
-        children = list(sdt_content)
-        ref_idx = children.index(ref_para)
-        insert_pos = ref_idx + 1 if insert_after else ref_idx
-        sdt_content.insert(insert_pos, new_para)
-
-        return ET.tostring(root, encoding="unicode")
-
-    except ET.ParseError:
-        return sdt_xml
-
-
-def _toc_delete_entry(sdt_xml, p_idx):
-    """Delete a specific entry from an SDT (TOC) block.
-
-    Args:
-        sdt_xml: SDT XML string.
-        p_idx: Paragraph index within sdtContent (0-based).
-
-    Returns:
-        Modified SDT XML string.
-    """
-    try:
-        root = ET.fromstring(sdt_xml)
-        sdt_content = root.find("w:sdtContent", NAMESPACES)
-        if sdt_content is None:
-            return sdt_xml
-
-        paragraphs = sdt_content.findall("w:p", NAMESPACES)
-        if p_idx >= len(paragraphs):
-            return sdt_xml
-
-        sdt_content.remove(paragraphs[p_idx])
-        return ET.tostring(root, encoding="unicode")
-
-    except ET.ParseError:
-        return sdt_xml
-
-
-def _find_toc_paragraph_by_level(paragraphs, target_tpl):
-    """Find an existing TOC paragraph matching the target level.
-
-    Args:
-        paragraphs: List of paragraph elements in sdtContent.
-        target_tpl: TOCStyleTemplate dict.
-
-    Returns:
-        Matching paragraph element or None.
-    """
-    w_ns = NAMESPACES["w"]
-    tpl_style_name = ""
-    tpl_indent_left = 0
-
-    toc_xml_template = target_tpl.get("toc_xml_template", "")
-    if toc_xml_template:
-        try:
-            tpl_root = ET.fromstring(toc_xml_template)
-            tpl_pstyle = tpl_root.find(".//w:pStyle", NAMESPACES)
-            if tpl_pstyle is not None:
-                tpl_style_name = tpl_pstyle.get(f"{{{w_ns}}}val", "")
-            tpl_ind = tpl_root.find(".//w:ind", NAMESPACES)
-            if tpl_ind is not None:
-                tpl_indent_left = int(
-                    tpl_ind.get(f"{{{w_ns}}}left", "0"),
-                )
-        except ET.ParseError:
-            pass
-
-    for p in paragraphs:
-        if not any(
-            t.text
-            for t in p.findall(".//w:t", NAMESPACES)
-            if t.text
-        ):
-            continue
-        ppr = p.find("w:pPr", NAMESPACES)
-
-        if tpl_style_name and ppr is not None:
-            pstyle = ppr.find("w:pStyle", NAMESPACES)
-            if pstyle is not None:
-                if pstyle.get(f"{{{w_ns}}}val") == tpl_style_name:
-                    return p
-
-        indent = 0
-        if ppr is not None:
-            ind = ppr.find("w:ind", NAMESPACES)
-            if ind is not None:
-                try:
-                    indent = int(ind.get(f"{{{w_ns}}}left", "0"))
-                except ValueError:
-                    indent = 0
-        if indent == tpl_indent_left:
-            return p
-
-    return None
-
-
-def _update_toc_hyperlinks(para, hyperlinks, number, title, page, anchor):
-    """Update TOC paragraph with hyperlink structure.
-
-    Args:
-        para: Paragraph element.
-        hyperlinks: List of hyperlink elements.
-        number: Entry number string.
-        title: Entry title string.
-        page: Page number string.
-        anchor: Bookmark anchor name.
-    """
-    # Update anchor on all hyperlinks
-    for hl in hyperlinks:
-        hl.set(f"{{{NAMESPACES['w']}}}anchor", anchor)
-
-    # Update number in first hyperlink
-    if len(hyperlinks) >= 1:
-        first_hl = hyperlinks[0]
-        t_elems = first_hl.findall(".//w:t", NAMESPACES)
-        if t_elems:
-            t_elems[0].text = number
-            for t in t_elems[1:]:
-                t.text = ""
-
-    # Update PAGEREF instrText
-    instr_texts = para.findall(".//w:instrText", NAMESPACES)
-    for instr in instr_texts:
-        if instr.text and "PAGEREF" in instr.text:
-            instr.text = f" PAGEREF {anchor} \\h "
-
-    # Update runs inside PAGEREF field
-    all_runs = para.findall(".//w:r", NAMESPACES)
-    in_pageref = False
-    pageref_runs = []
-
-    for run in all_runs:
-        fld_char = run.find("w:fldChar", NAMESPACES)
-        if fld_char is not None:
-            fld_type = fld_char.get(f"{{{NAMESPACES['w']}}}fldCharType")
-            if fld_type == "separate":
-                in_pageref = True
-                continue
-            elif fld_type == "end":
-                in_pageref = False
-                continue
-        if in_pageref:
-            pageref_runs.append(run)
-
-    # Split at tab boundary
-    pre_tab_texts = []
-    post_tab_texts = []
-    found_tab = False
-
-    for run in pageref_runs:
-        if run.find("w:tab", NAMESPACES) is not None:
-            found_tab = True
-        for t in run.findall("w:t", NAMESPACES):
-            if not found_tab:
-                pre_tab_texts.append(t)
-            else:
-                post_tab_texts.append(t)
-
-    xml_space = "{http://www.w3.org/XML/1998/namespace}space"
-
-    if pre_tab_texts:
-        pre_tab_texts[0].text = title
-        pre_tab_texts[0].set(xml_space, "preserve")
-        for t in pre_tab_texts[1:]:
-            t.text = ""
-
-    if post_tab_texts:
-        if not pre_tab_texts:
-            post_tab_texts[0].text = title
-            post_tab_texts[0].set(xml_space, "preserve")
-            if len(post_tab_texts) > 1:
-                post_tab_texts[1].text = page
-                post_tab_texts[1].set(xml_space, "preserve")
-                for t in post_tab_texts[2:]:
-                    t.text = ""
-        else:
-            post_tab_texts[0].text = page
-            post_tab_texts[0].set(xml_space, "preserve")
-            for t in post_tab_texts[1:]:
-                t.text = ""
-    elif not found_tab and len(pre_tab_texts) >= 2:
-        pre_tab_texts[-1].text = page
-        pre_tab_texts[-1].set(xml_space, "preserve")
-        for t in pre_tab_texts[1:-1]:
-            t.text = ""
-
-
-def _update_toc_simple(para, number, title, page):
-    """Update TOC paragraph with simple text structure.
-
-    Args:
-        para: Paragraph element.
-        number: Entry number string.
-        title: Entry title string.
-        page: Page number string.
-    """
-    xml_space = "{http://www.w3.org/XML/1998/namespace}space"
-    w_ns = NAMESPACES["w"]
-
-    runs = para.findall(".//w:r", NAMESPACES)
-    first_text_set = False
-    page_set = False
-
-    for run in runs:
-        has_tab = run.find("w:tab", NAMESPACES) is not None
-        t_elems = run.findall("w:t", NAMESPACES)
-        for t in t_elems:
-            if not first_text_set:
-                t.text = f"{number} {title}"
-                t.set(xml_space, "preserve")
-                first_text_set = True
-            elif has_tab and not page_set:
-                t.text = page
-                t.set(xml_space, "preserve")
-                page_set = True
-            else:
-                t.text = ""
-
-    if page and first_text_set and not page_set:
-        tab_run = ET.SubElement(para, f"{{{w_ns}}}r")
-        if runs:
-            src_rpr = runs[0].find("w:rPr", NAMESPACES)
-            if src_rpr is not None:
-                tab_run.append(copy.deepcopy(src_rpr))
-        ET.SubElement(tab_run, f"{{{w_ns}}}tab")
-        page_t = ET.SubElement(tab_run, f"{{{w_ns}}}t")
-        page_t.text = page
-        page_t.set(xml_space, "preserve")
-
-
-# -------------------------------------------------------------------
-# Bookmark injection
-# -------------------------------------------------------------------
-
-def _inject_bookmark_into_paragraph(para_xml, anchor_name, bookmark_id):
-    """Inject bookmarkStart/End into a body paragraph.
-
-    Args:
-        para_xml: Paragraph XML string.
-        anchor_name: Bookmark name.
-        bookmark_id: Unique numeric bookmark ID.
-
-    Returns:
-        Modified paragraph XML string.
-    """
-    ns_w = NAMESPACES["w"]
-    bk_start = (
-        f'<w:bookmarkStart w:id="{bookmark_id}" '
-        f'w:name="{anchor_name}" '
-        f'xmlns:w="{ns_w}"/>'
-    )
-    bk_end = (
-        f'<w:bookmarkEnd w:id="{bookmark_id}" '
-        f'xmlns:w="{ns_w}"/>'
-    )
-
-    try:
-        root = ET.fromstring(para_xml)
-    except ET.ParseError:
-        return para_xml
-
-    bk_start_elem = ET.fromstring(bk_start)
-    bk_end_elem = ET.fromstring(bk_end)
-
-    pPr = root.find(f"{{{ns_w}}}pPr")
-    if pPr is not None:
-        idx = list(root).index(pPr) + 1
-    else:
-        idx = 0
-
-    root.insert(idx, bk_start_elem)
-    root.insert(idx + 1, bk_end_elem)
-
-    return ET.tostring(root, encoding="unicode")
-
-
-# -------------------------------------------------------------------
 # Main assembly loop
 # -------------------------------------------------------------------
 
 def assemble_document_xml(blocks, paragraph_style_templates,
-                          table_style_templates, toc_style_templates,
+                          table_style_templates,
                           style_alias_map):
     """Assemble document.xml body content from modified blocks.
 
@@ -2115,7 +1665,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
         blocks: List of block dicts with edit markers.
         paragraph_style_templates: PST dict pool.
         table_style_templates: TST dict pool.
-        toc_style_templates: TOC style template pool.
         style_alias_map: Full alias map.
 
     Returns:
@@ -2123,9 +1672,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
     """
     body_parts = []
     block_id_to_parts_idx = {}
-    pending_bookmarks = {}
-    bookmark_counter = 0
-    toc_modified = False
 
     for block in blocks:
         # Skip deleted blocks
@@ -2160,7 +1706,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
 
             block_type = block.get("type", "")
             is_table = block_type == "tbl"
-            is_sdt = block_type == "sdt"
 
             if is_table:
                 current_xml = block["xml"]
@@ -2293,64 +1838,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                             current_xml = ET.tostring(root, encoding="unicode")
                         except ET.ParseError:
                             pass
-
-                body_parts.append(current_xml)
-
-            elif is_sdt:
-                current_xml = block["xml"]
-                toc_modified = True
-
-                # 1. Entry deletions (reverse order)
-                for p_idx in sorted(
-                    block.get("_sdt_entry_deletions", []), reverse=True,
-                ):
-                    current_xml = _toc_delete_entry(current_xml, p_idx)
-
-                # 2. Entry-level replacements
-                for replacement in replacements:
-                    m = re.search(
-                        r":p(\d+)$", replacement["original_target_id"],
-                    )
-                    if m:
-                        p_idx = int(m.group(1))
-                        tl = replacement.get("toc_level_alias")
-                        anchor_bid = replacement.get("anchor_block_id")
-                        anchor_name = None
-                        if anchor_bid:
-                            anchor_name = f"_Toc{bookmark_counter:08d}"
-                            pending_bookmarks[anchor_bid] = anchor_name
-                            bookmark_counter += 1
-                        current_xml = _toc_replace_entry(
-                            current_xml, p_idx,
-                            replacement["content"],
-                            toc_level_alias=tl,
-                            anchor_name=anchor_name,
-                        )
-
-                # 3. Entry inserts (reverse order)
-                sdt_inserts = block.get("_sdt_entry_inserts", [])
-                for insert in sorted(
-                    sdt_inserts,
-                    key=lambda x: (
-                        x["para_idx"], x.get("_insert_order", 0),
-                    ),
-                    reverse=True,
-                ):
-                    anchor_bid = insert.get("anchor_block_id")
-                    anchor_name = None
-                    if anchor_bid:
-                        anchor_name = f"_Toc{bookmark_counter:08d}"
-                        pending_bookmarks[anchor_bid] = anchor_name
-                        bookmark_counter += 1
-                    current_xml = _toc_insert_entry(
-                        current_xml,
-                        insert["para_idx"],
-                        insert["content"],
-                        toc_level_alias=insert.get("toc_level_alias"),
-                        insert_after=insert.get("insert_after", True),
-                        anchor_name=anchor_name,
-                        toc_style_templates=toc_style_templates,
-                    )
 
                 body_parts.append(current_xml)
 
@@ -2488,15 +1975,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                     if xml:
                         body_parts.append(xml)
 
-    # Post-process: inject bookmarks into heading paragraphs
-    for bid, anchor_name in pending_bookmarks.items():
-        idx = block_id_to_parts_idx.get(bid)
-        if idx is not None and idx < len(body_parts):
-            body_parts[idx] = _inject_bookmark_into_paragraph(
-                body_parts[idx], anchor_name, bookmark_counter,
-            )
-            bookmark_counter += 1
-
     return "".join(body_parts)
 
 
@@ -2606,7 +2084,6 @@ def main():
     # Load template data
     paragraph_style_templates = analysis.get("paragraph_style_templates", {})
     table_style_templates = analysis.get("table_style_templates", {})
-    toc_style_templates = analysis.get("toc_style_templates", {})
     style_alias_map = analysis.get("style_alias_map", {})
     blocks = analysis.get("blocks", [])
 
@@ -2626,7 +2103,6 @@ def main():
         marked_blocks,
         paragraph_style_templates,
         table_style_templates,
-        toc_style_templates,
         style_alias_map,
     )
 

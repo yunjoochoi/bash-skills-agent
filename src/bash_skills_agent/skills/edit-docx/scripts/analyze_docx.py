@@ -59,7 +59,7 @@ _IGNORED_RPR_TAGS = frozenset({
 # ============================================================================
 
 class _AnalyzerState:
-    """Mutable state for table/TOC deduplication caches.
+    """Mutable state for table deduplication caches.
 
     Replaces DocxAnalyzer instance variables.
     """
@@ -73,9 +73,6 @@ class _AnalyzerState:
         "_cs_counter",
         "_row_style_map",
         "_cell_style_map",
-        "_toc_level_cache",
-        "_tl_counter",
-        "_toc_style_templates",
     )
 
     def __init__(self):
@@ -92,11 +89,6 @@ class _AnalyzerState:
         # Maps: alias -> template XML (populated during analysis)
         self._row_style_map = {}   # RS0 -> tr_pr_xml
         self._cell_style_map = {}  # CS0 -> tc_xml_template
-
-        # TOC style management
-        self._toc_level_cache = {}   # fingerprint -> TL alias
-        self._tl_counter = 0
-        self._toc_style_templates = {}  # TL0 -> template dict
 
 
 # ============================================================================
@@ -707,233 +699,6 @@ def _extract_table_hierarchy(tbl_element, state):
     return table_template, row_style_aliases, cell_style_map
 
 
-# ============================================================================
-# TOC Handling
-# ============================================================================
-
-def _toc_level_fingerprint(indent_left, borders, bold):
-    """Generate fingerprint for TOC level deduplication.
-
-    Primary: w:pBdr (paragraph borders) - different borders = different level.
-    Secondary: indent (distinguishes levels with same border style).
-    Tabs excluded (not all TOCs have tabs).
-
-    Args:
-        indent_left: Left indent in twips
-        borders: Frozenset of serialized border elements from w:pBdr
-        bold: Whether first run is bold
-
-    Returns:
-        Fingerprint string for cache lookup
-    """
-    border_key = ",".join(sorted(borders)) if borders else "none"
-    parts = [f"borders:{border_key}", f"indent:{indent_left}"]
-    if bold:
-        parts.append("bold:True")
-    return "|".join(parts)
-
-
-def _extract_toc_paragraph_template(p_element):
-    """Extract TOC paragraph template preserving structure.
-
-    Deep copies the paragraph, replaces text placeholders:
-    - Number text -> {{number}}
-    - Title text -> {{title}}
-    - Page number -> {{page}}
-    - Anchor references -> {{anchor}}
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        Template XML string with placeholders
-    """
-    template = copy.deepcopy(p_element)
-    w_ns = NAMESPACES["w"]
-
-    # Update anchor on hyperlinks
-    for hl in template.findall(".//w:hyperlink", NAMESPACES):
-        hl.set(f"{{{w_ns}}}anchor", "{{anchor}}")
-
-    # Update PAGEREF instrText
-    for instr in template.findall(".//w:instrText", NAMESPACES):
-        if instr.text and "PAGEREF" in instr.text:
-            instr.text = " PAGEREF {{anchor}} \\h "
-
-    # Replace text content in runs
-    hyperlinks = template.findall(".//w:hyperlink", NAMESPACES)
-    if hyperlinks and len(hyperlinks) >= 1:
-        # Complex structure: first hyperlink has number
-        first_hl = hyperlinks[0]
-        t_elems = first_hl.findall(".//w:t", NAMESPACES)
-        if t_elems:
-            t_elems[0].text = "{{number}}"
-            for t in t_elems[1:]:
-                t.text = ""
-
-    # Replace title/page in PAGEREF field runs
-    all_runs = template.findall(".//w:r", NAMESPACES)
-    in_pageref = False
-    title_set = False
-    page_set = False
-
-    for run in all_runs:
-        fld_char = run.find("w:fldChar", NAMESPACES)
-        if fld_char is not None:
-            fld_type = fld_char.get(f"{{{w_ns}}}fldCharType")
-            if fld_type == "separate":
-                in_pageref = True
-                continue
-            elif fld_type == "end":
-                in_pageref = False
-                continue
-
-        if in_pageref:
-            t_elems = run.findall("w:t", NAMESPACES)
-            for t in t_elems:
-                if not title_set:
-                    t.text = "{{title}}"
-                    title_set = True
-                elif not page_set:
-                    tab = run.find("w:tab", NAMESPACES)
-                    if tab is not None or (t.text and t.text.strip().isdigit()):
-                        t.text = "{{page}}"
-                        page_set = True
-                    else:
-                        t.text = ""
-
-    # If no hyperlinks (simple structure), replace all text
-    if not hyperlinks:
-        runs = template.findall(".//w:r", NAMESPACES)
-        first_text_set = False
-        for run in runs:
-            for t in run.findall("w:t", NAMESPACES):
-                if not first_text_set:
-                    t.text = "{{number}} {{title}}"
-                    first_text_set = True
-                else:
-                    t.text = ""
-        # Append {{page}} as a separate run with <w:tab/> element
-        if first_text_set and runs:
-            page_run = ET.SubElement(template, f"{{{w_ns}}}r")
-            src_rpr = runs[0].find("w:rPr", NAMESPACES)
-            if src_rpr is not None:
-                page_run.append(copy.deepcopy(src_rpr))
-            ET.SubElement(page_run, f"{{{w_ns}}}tab")
-            page_t = ET.SubElement(page_run, f"{{{w_ns}}}t")
-            page_t.text = "{{page}}"
-
-    return ET.tostring(template, encoding="unicode")
-
-
-def _extract_toc_entry_levels(sdt_element, state):
-    """Extract hierarchical TOC styles from SDT element.
-
-    For each paragraph in sdtContent:
-    1. Extract indent, borders, bold for fingerprinting
-    2. Assign TL alias via deduplication cache
-    3. Build entry_levels mapping (paragraph index -> TL alias)
-
-    Args:
-        sdt_element: SDT XML element containing TOC
-        state: _AnalyzerState instance
-
-    Returns:
-        Dict mapping paragraph index to TL alias
-    """
-    w_ns = NAMESPACES["w"]
-
-    sdt_content = sdt_element.find("w:sdtContent", NAMESPACES)
-    if sdt_content is None:
-        return {}
-
-    paragraphs = sdt_content.findall(".//w:p", NAMESPACES)
-    if not paragraphs:
-        return {}
-
-    entry_levels = {}
-
-    for p_idx, p in enumerate(paragraphs):
-        # Skip empty paragraphs
-        p_text = ""
-        for t in p.findall(".//w:t", NAMESPACES):
-            if t.text:
-                p_text += t.text
-        if not p_text.strip():
-            continue
-
-        ppr = p.find("w:pPr", NAMESPACES)
-
-        # Extract indent
-        indent_left = 0
-        if ppr is not None:
-            ind = ppr.find("w:ind", NAMESPACES)
-            if ind is not None:
-                left_val = ind.get(f"{{{w_ns}}}left", "0")
-                try:
-                    indent_left = int(left_val)
-                except ValueError:
-                    indent_left = 0
-
-        # Extract borders for fingerprinting
-        borders = frozenset()
-        if ppr is not None:
-            pbdr = ppr.find("w:pBdr", NAMESPACES)
-            if pbdr is not None:
-                borders = frozenset(
-                    ET.tostring(child, encoding="unicode")
-                    for child in pbdr
-                )
-
-        # Extract bold from first run for fingerprinting
-        bold = False
-        first_run = p.find(".//w:r", NAMESPACES)
-        if first_run is not None:
-            rpr = first_run.find("w:rPr", NAMESPACES)
-            if rpr is not None:
-                b_elem = rpr.find("w:b", NAMESPACES)
-                if b_elem is not None:
-                    val = b_elem.get(f"{{{w_ns}}}val", "true")
-                    bold = val != "false" and val != "0"
-
-        # Compute fingerprint and assign alias
-        fp = _toc_level_fingerprint(indent_left, borders, bold)
-
-        if fp not in state._toc_level_cache:
-            alias = f"TL{state._tl_counter}"
-            state._toc_level_cache[fp] = alias
-            state._tl_counter += 1
-
-            # Extract paragraph template
-            xml_template = _extract_toc_paragraph_template(p)
-
-            # Collect run style templates from paragraph
-            run_templates = {}
-            seen_rpr = set()
-            for run in p.findall(".//w:r", NAMESPACES):
-                if not _run_has_text(run):
-                    continue
-                rst = _build_run_style_template(run)
-                if rst["rpr_key"] not in seen_rpr:
-                    run_templates[f"RS{len(run_templates)}"] = rst
-                    seen_rpr.add(rst["rpr_key"])
-
-            state._toc_style_templates[alias] = {
-                "toc_style_key": alias,
-                "toc_xml_template": xml_template,
-                "run_style_templates": run_templates,
-                "display_description": (
-                    f"TOC Level {state._tl_counter}"
-                    f" (indent: {indent_left}twips)"
-                ),
-            }
-
-        tl_alias = state._toc_level_cache[fp]
-        entry_levels[p_idx] = tl_alias
-
-    return entry_levels
-
-
 def _get_toc_entry_text(block, para_idx):
     """Extract text from a specific TOC paragraph by index.
 
@@ -1175,7 +940,6 @@ def parse_document_blocks(extracted_path, state):
                 "semantic_tag": "BODY",
                 "row_style_aliases": None,
                 "cell_style_map": None,
-                "toc_entry_levels": None,
             })
             block_id += 1
 
@@ -1198,7 +962,6 @@ def parse_document_blocks(extracted_path, state):
                 "semantic_tag": "TBL",
                 "row_style_aliases": row_aliases,
                 "cell_style_map": cell_alias_map,
-                "toc_entry_levels": None,
             })
             block_id += 1
 
@@ -1210,14 +973,8 @@ def parse_document_blocks(extracted_path, state):
             text = _extract_sdt_text(child)
             xml_str = ET.tostring(child, encoding="unicode")
 
-            toc_entry_levels = None
-            semantic_tag = "SDT"
-            style_key = "sdt_default"
-
-            if is_toc:
-                toc_entry_levels = _extract_toc_entry_levels(child, state)
-                semantic_tag = "TOC"
-                style_key = "toc_default"
+            semantic_tag = "TOC" if is_toc else "SDT"
+            style_key = "toc_default" if is_toc else "sdt_default"
 
             blocks.append({
                 "id": f"b{block_id}",
@@ -1228,7 +985,6 @@ def parse_document_blocks(extracted_path, state):
                 "semantic_tag": semantic_tag,
                 "row_style_aliases": None,
                 "cell_style_map": None,
-                "toc_entry_levels": toc_entry_levels,
             })
             block_id += 1
 
@@ -1531,19 +1287,27 @@ def generate_text_merge(parsed_result, state):
                 for row_line in table_lines["lines"]:
                     lines.append(f"  {row_line}")
         elif block["type"] == "sdt":
-            if block["toc_entry_levels"]:
-                # TOC with level-aware formatting
+            if block["semantic_tag"] == "TOC":
+                # Show individual TOC entries with paragraph IDs
                 lines.append(block_marker)
-                for p_idx, tl_alias in sorted(
-                    block["toc_entry_levels"].items(),
-                    key=lambda x: x[0],
-                ):
-                    if tl_alias not in style_alias_map:
-                        style_alias_map[tl_alias] = tl_alias
-                    entry_text = _get_toc_entry_text(block, p_idx)
-                    lines.append(
-                        f"  [{block['id']}:p{p_idx}|{tl_alias}] {entry_text}"
-                    )
+                try:
+                    root = ET.fromstring(block["xml"])
+                    sdt_content = root.find("w:sdtContent", NAMESPACES)
+                    if sdt_content is not None:
+                        for p_idx, p in enumerate(
+                            sdt_content.findall(".//w:p", NAMESPACES)
+                        ):
+                            p_text = "".join(
+                                t.text
+                                for t in p.findall(".//w:t", NAMESPACES)
+                                if t.text
+                            )
+                            if p_text.strip():
+                                lines.append(
+                                    f"  [{block['id']}:p{p_idx}] {p_text}"
+                                )
+                except ET.ParseError:
+                    lines.append(f"  {block['text']}")
             else:
                 lines.append(f"{block_marker} {block['text']}")
 
@@ -1578,15 +1342,7 @@ def analyze(docx_path, work_dir):
     text_merge, style_alias_map = generate_text_merge(parsed_result, state)
 
     # Build output dict (all plain dicts, no Pydantic)
-    # Convert toc_entry_levels keys from int to str for JSON serialization
-    serializable_blocks = []
-    for block in parsed_result:
-        b = dict(block)
-        if b["toc_entry_levels"] is not None:
-            b["toc_entry_levels"] = {
-                str(k): v for k, v in b["toc_entry_levels"].items()
-            }
-        serializable_blocks.append(b)
+    serializable_blocks = list(parsed_result)
 
     # Convert table_style_templates row_styles/cell_style_templates keys
     serializable_table_templates = {}
@@ -1602,7 +1358,6 @@ def analyze(docx_path, work_dir):
         "style_alias_map": style_alias_map,
         "paragraph_style_templates": paragraph_templates,
         "table_style_templates": serializable_table_templates,
-        "toc_style_templates": state._toc_style_templates,
         "extracted_path": extracted_path,
     }
 

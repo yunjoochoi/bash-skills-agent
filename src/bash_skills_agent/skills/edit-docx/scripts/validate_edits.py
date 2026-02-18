@@ -2,8 +2,8 @@
 """Pre-apply validation of edits.json against analysis.json.
 
 Validates target_id existence, style alias references, table field
-completeness, paragraph newline rules, TOC constraints, and optional
-run distribution specs — all before apply_edits.py touches the XML.
+completeness, paragraph newline rules, and optional run distribution
+specs — all before apply_edits.py touches the XML.
 
 Usage:
     python3 validate_edits.py <work_dir>
@@ -44,7 +44,6 @@ _RE_SDT_PARA = re.compile(r"^b(\d+):p(\d+)$")
 VALID_ACTIONS = {"replace", "insert_after", "insert_before", "delete"}
 PARAGRAPH_TAGS = {"H1", "H2", "H3", "BODY", "LIST", "TITLE", "SUBTITLE", "OTHER"}
 TABLE_TAG = "TBL"
-TOC_TAG = "TOC"
 
 
 # -------------------------------------------------------------------
@@ -329,13 +328,6 @@ def validate_style_aliases(edits, alias_map):
                             i, tid, "cell_style_alias",
                             f"Cell style alias '{row_cs}' not in alias map"))
 
-        # TOC level alias
-        if tag == TOC_TAG:
-            tla = edit.get("toc_level_alias")
-            if action != "delete" and tla and tla not in alias_map:
-                issues.append(_err(i, tid, "toc_level_alias",
-                                   f"TOC level alias '{tla}' not in alias map"))
-
     return issues
 
 
@@ -403,7 +395,7 @@ def validate_newlines(edits):
 
         if action == "delete" or not new_text:
             continue
-        if tag in (TABLE_TAG, TOC_TAG):
+        if tag == TABLE_TAG:
             continue
         if "\n" in new_text:
             issues.append(_err(
@@ -441,30 +433,6 @@ def validate_column_counts(edits, index):
             issues.append(_warn(
                 i, tid, "column_count",
                 f"new_text has {text_cols} cells but table has {table_cols} columns"))
-
-    return issues
-
-
-def validate_toc_rules(edits, index):
-    """Enforce TOC-specific constraints."""
-    issues = []
-    for i, edit in enumerate(edits):
-        tid = edit.get("target_id", "")
-        tag = edit.get("semantic_tag", "")
-        action = edit.get("action", "")
-
-        if tag != TOC_TAG:
-            continue
-
-        if action in ("replace", "insert_after", "insert_before"):
-            anchor = edit.get("anchor_block_id")
-            if not anchor:
-                issues.append(_err(i, tid, "anchor_block_id",
-                                   "anchor_block_id required for TOC INSERT/REPLACE"))
-            elif anchor not in index.id_to_block:
-                issues.append(_err(
-                    i, tid, "anchor_block_id",
-                    f"anchor_block_id '{anchor}' does not exist"))
 
     return issues
 
@@ -526,7 +494,6 @@ def validate(work_dir):
     all_issues.extend(validate_table_fields(edits, index))
     all_issues.extend(validate_newlines(edits))
     all_issues.extend(validate_column_counts(edits, index))
-    all_issues.extend(validate_toc_rules(edits, index))
     all_issues.extend(validate_runs(edits, alias_map, pst))
 
     for issue in all_issues:

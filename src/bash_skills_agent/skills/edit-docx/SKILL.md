@@ -12,6 +12,8 @@ description: Edit existing DOCX documents (preserving styles) or create new ones
 
 ## A. Editing Workflow (Modify Existing DOCX)
 
+**IMPORTANT: Execute steps IN ORDER. Each step depends on the previous step's output.**
+
 ### Step 1: Analyze Document
 
 ```
@@ -39,8 +41,8 @@ Read the text_merge output from Step 1. It shows document structure like:
     [b3:r1c0|CS0] [p0|S4] Data1
     [b3:r1c1|CS1] [p0|S4] Data2
 [b4:TOC|toc_default]
-  [b4:p0|TL0] 1. Introduction | 3
-  [b4:p1|TL1] 1-1. Background | 4
+  [b4:p0] 1. Introduction 3
+  [b4:p1] 1-1. Background 4
 ```
 
 Based on user's request, write an edit plan JSON to `/workspace/docx_work/edits.json`:
@@ -63,11 +65,13 @@ Validates edits.json against analysis.json. Outputs JSON with errors/warnings.
 - If `"valid": false` — fix edits.json based on error messages and re-validate.
 - If `"valid": true` — proceed to Step 4.
 
-### Step 3.5: Run Distribution (if needed)
+### Step 3.5: Run Distribution (if needed) — REQUIRES edits.json from Step 2
 
 ```
 bash(command="python3 /skills/edit-docx/scripts/generate_run_prompts.py /workspace/docx_work")
 ```
+
+**Prerequisites:** edits.json must exist (from Step 2) and pass validation (Step 3).
 
 If the output has prompts (`"prompts": [...]` non-empty), process each:
 1. Read the `prompt` text — it shows run styles (RS0, RS1...) with descriptions
@@ -100,7 +104,7 @@ This reads `analysis.json` + `edits.json` and modifies `document.xml`.
 bash(command="python3 /skills/edit-docx/scripts/repack_docx.py /workspace/<input.docx> /workspace/docx_work/extracted /workspace/<output.docx>")
 ```
 
-This creates the final edited DOCX. Add `--update-fields` flag if TOC was modified.
+This creates the final edited DOCX. Do NOT use `--update-fields` if TOC was manually edited (see Section D).
 
 ### Step 6: Validate Output DOCX
 
@@ -116,7 +120,7 @@ Validates the output DOCX structure and content. Outputs JSON with errors/warnin
 
 ## B. Edit Plan JSON Format
 
-### Three Edit Types
+### Two Edit Types
 
 `semantic_tag` determines the edit type:
 
@@ -152,22 +156,6 @@ Fields: `action`, `target_id`, `semantic_tag`, `new_text`, `style_alias`, `reaso
 
 Fields: `action`, `target_id`, `semantic_tag`, `edit_unit`, `new_text`, `table_style_alias`, `row_style_aliases`, `cell_style_aliases`, `reasoning`
 
-#### 3. TOC Edit (semantic_tag: TOC)
-
-```json
-{
-  "action": "replace",
-  "target_id": "b5:p1",
-  "semantic_tag": "TOC",
-  "new_text": "1-1. New Title | 4",
-  "toc_level_alias": "TL1",
-  "anchor_block_id": "b10",
-  "reasoning": "Update TOC entry for renamed section"
-}
-```
-
-Fields: `action`, `target_id`, `semantic_tag`, `new_text`, `toc_level_alias`, `anchor_block_id`, `reasoning`
-
 ### Action Types
 
 | Action | Value | Description |
@@ -183,8 +171,9 @@ Fields: `action`, `target_id`, `semantic_tag`, `new_text`, `toc_level_alias`, `a
 
 ### semantic_tag is REQUIRED for ALL edits
 - Copy TAG from text_merge: `[b5:BODY|S2]` → `"semantic_tag": "BODY"`
-- TBL → Table edit, TOC → TOC edit, everything else → Paragraph edit
-- Valid tags: H1, H2, H3, BODY, LIST, TBL, TITLE, SUBTITLE, TOC, OTHER
+- TBL → Table edit, everything else → Paragraph edit
+- Valid tags: H1, H2, H3, BODY, LIST, TBL, TITLE, SUBTITLE, OTHER
+- TOC blocks are NOT edited via edits.json — see Section D for TOC editing
 
 ### Paragraph Rules
 - **style_alias is REQUIRED** for REPLACE and INSERT
@@ -244,24 +233,59 @@ To insert a heading + body text after b10:
 {"action": "delete", "target_id": "b13:c1", "semantic_tag": "TBL", "edit_unit": "column"}
 ```
 
-### TOC Rules
+---
 
-All TOC edits operate at the **entry (row) level** using `b5:pN` target_id format.
+## D. TOC (Table of Contents) Editing
 
-- `toc_level_alias`: TL alias for level (TL0=level1, TL1=level2, TL2=level3)
-- `anchor_block_id`: **REQUIRED** for INSERT and REPLACE — body heading block ID for bookmark linking
+TOC editing is done via **direct XML manipulation** using bash, NOT through edits.json.
 
-**TOC Consistency Rules:**
-- TOC INSERT **MUST** accompany a body heading INSERT with matching anchor_block_id
-- TOC DELETE **MUST** accompany a body heading DELETE
-- TOC REPLACE is allowed only when the corresponding body heading text also changes
-- NEVER add/remove TOC entries without corresponding body heading changes
+### TOC Structure in DOCX
 
-Page numbers are placeholders. Word auto-updates on open (Ctrl+A, F9).
+The TOC is an `<w:sdt>` block containing `<w:sdtContent>` with paragraphs. Each entry links to a body heading via bookmarks:
+
+**TOC entry** (inside `<w:sdtContent>`):
+```xml
+<w:hyperlink w:anchor="_Toc12345">
+  <w:r><w:t>1. Introduction</w:t></w:r>
+</w:hyperlink>
+<!-- PAGEREF field code for page number -->
+<w:r><w:fldChar w:fldCharType="begin"/></w:r>
+<w:r><w:instrText> PAGEREF _Toc12345 \h </w:instrText></w:r>
+<w:r><w:fldChar w:fldCharType="separate"/></w:r>
+<w:r><w:t>3</w:t></w:r>
+<w:r><w:fldChar w:fldCharType="end"/></w:r>
+```
+
+**Body heading** (bookmark target):
+```xml
+<w:bookmarkStart w:id="0" w:name="_Toc12345"/>
+<w:r><w:t>1. Introduction</w:t></w:r>
+<w:bookmarkEnd w:id="0"/>
+```
+
+### How to Edit TOC
+
+Use `lxml` for TOC XML manipulation. lxml preserves namespace prefixes and handles OOXML reliably.
+
+1. Read the extracted `document.xml` and parse with `lxml.etree`
+2. Find the TOC `<w:sdt>` block and the target heading's bookmark
+3. Edit operations:
+   - **Add entry**: Copy an existing TOC paragraph, change anchor name + text + PAGEREF
+   - **Modify entry**: Update text in `<w:t>` and anchor in `<w:hyperlink>` + PAGEREF
+   - **Delete entry**: Remove the `<w:p>` from `<w:sdtContent>`
+   - **Add bookmark**: Insert `<w:bookmarkStart>` / `<w:bookmarkEnd>` around body heading
+4. Save with `tree.write()`
+
+### Key Rules
+- TOC `<w:hyperlink w:anchor="name">` must match body `<w:bookmarkStart w:name="name">`
+- PAGEREF instrText must reference the same bookmark name
+- Bookmark IDs must be unique across the document
+- **DO NOT use `--update-fields` flag** when TOC was manually edited — it causes Word to rebuild the entire TOC from heading styles, wiping out manual XML entries
+- Page numbers in manually added entries are static placeholders
 
 ---
 
-## D. Creating New DOCX
+## E. Creating New DOCX
 
 ### Step 1: Write Content JSON
 
@@ -296,7 +320,7 @@ bash(command="python3 /skills/edit-docx/scripts/create_docx.py /workspace/conten
 
 ---
 
-## E. Final Checklist
+## F. Final Checklist
 
 Before writing edits.json, verify:
 1. Every edit has `semantic_tag`
@@ -306,8 +330,13 @@ Before writing edits.json, verify:
 5. Table INSERT has `table_style_alias`
 6. No `\n` in paragraph `new_text`
 7. `new_text` is COMPLETE content
-8. TOC INSERT/REPLACE has `anchor_block_id`
-9. TOC entry `target_id` uses `bN:pN` format
-10. Run `validate_edits.py` before `apply_edits.py`
-11. Run `generate_run_prompts.py` and process prompts before `apply_edits.py`
-12. Run `validate_docx.py` after `repack_docx.py`
+8. TOC edits are NOT in edits.json (handle via direct XML — see Section D)
+
+Execution order (MUST follow):
+9. Write `edits.json` FIRST (Step 2)
+10. Run `validate_edits.py` (Step 3) — fix errors and re-validate until valid
+11. Run `generate_run_prompts.py` AFTER edits.json is finalized (Step 3.5) — process prompts if any
+12. Run `apply_edits.py` (Step 4)
+13. Edit TOC XML directly if needed (Section D)
+14. Run `repack_docx.py` (Step 5) — **without** `--update-fields` if TOC was manually edited
+15. Run `validate_docx.py` (Step 6) — verify output DOCX
