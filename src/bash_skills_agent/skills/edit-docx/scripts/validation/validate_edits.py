@@ -45,6 +45,19 @@ VALID_ACTIONS = {"replace", "insert_after", "insert_before", "delete"}
 PARAGRAPH_TAGS = {"H1", "H2", "H3", "BODY", "LIST", "TITLE", "SUBTITLE", "OTHER"}
 TABLE_TAG = "TBL"
 
+# Common number prefix patterns that would duplicate auto-numbering (numPr)
+_RE_NUM_PREFIX = re.compile(
+    r"^(?:"
+    r"\d+(?:[-\.]\d+)*\.\s"        # 1. 1-1. 1-1-1. 1.1.
+    r"|\d+(?:[-\.]\d+)*\)\s"       # 1) 1-1)
+    r"|[가-힣]\.\s"                 # 가. 나.
+    r"|[\(（]\d+[\)）]\s?"           # (1) （1）
+    r"|[\(（][가-힣][\)）]\s?"        # (가)
+    r"|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]"  # circled numbers
+    r"|[•·●○■□▪▸►]\s?"              # bullets
+    r")"
+)
+
 
 # -------------------------------------------------------------------
 # Data loading
@@ -406,7 +419,11 @@ def validate_newlines(edits):
 
 
 def validate_column_counts(edits, index):
-    """Warn when row INSERT cell count differs from table width."""
+    """Check row INSERT/REPLACE cell count against table width.
+
+    - INSERT: warning (new row may intentionally differ)
+    - REPLACE: error (mismatched cells cause silent data loss)
+    """
     issues = []
     for i, edit in enumerate(edits):
         tid = edit.get("target_id", "")
@@ -414,7 +431,9 @@ def validate_column_counts(edits, index):
         action = edit.get("action", "")
         new_text = edit.get("new_text", "")
 
-        if eu != "row" or action not in ("insert_after", "insert_before"):
+        if eu != "row":
+            continue
+        if action not in ("insert_after", "insert_before", "replace"):
             continue
         if not new_text or "|" not in new_text:
             continue
@@ -430,9 +449,12 @@ def validate_column_counts(edits, index):
         text_cols = len([c.strip() for c in new_text.split("|")])
         table_cols = tm.col_counts[0]
         if text_cols != table_cols:
-            issues.append(_warn(
-                i, tid, "column_count",
-                f"new_text has {text_cols} cells but table has {table_cols} columns"))
+            msg = (f"new_text has {text_cols} cells but table has "
+                   f"{table_cols} columns")
+            if action == "replace":
+                issues.append(_err(i, tid, "column_count", msg))
+            else:
+                issues.append(_warn(i, tid, "column_count", msg))
 
     return issues
 
@@ -472,6 +494,157 @@ def validate_runs(edits, alias_map, paragraph_style_templates):
     return issues
 
 
+def validate_edit_unit_format(edits):
+    """Error when edit_unit disagrees with target_id format.
+
+    Each edit_unit requires a specific target_id pattern:
+      column -> bN:cN
+      row    -> bN:rN
+      cell   -> bN:rNcN or bN:rNcNpN
+      table  -> bN
+    """
+    issues = []
+    UNIT_FORMATS = {
+        "column": ([_RE_COL], "bN:cN (e.g. b5:c0)"),
+        "row": ([_RE_ROW], "bN:rN (e.g. b5:r2)"),
+        "cell": ([_RE_CELL, _RE_CELL_PARA], "bN:rNcN or bN:rNcNpN"),
+        "table": ([_RE_BLOCK], "bN (e.g. b5)"),
+    }
+    for i, edit in enumerate(edits):
+        eu = edit.get("edit_unit")
+        tid = edit.get("target_id", "")
+        if not eu or eu not in UNIT_FORMATS:
+            continue
+        regexes, fmt_desc = UNIT_FORMATS[eu]
+        if not any(r.match(tid) for r in regexes):
+            issues.append(_err(
+                i, tid, "edit_unit_format",
+                f"edit_unit '{eu}' requires target_id format "
+                f"'{fmt_desc}', got '{tid}'"))
+    return issues
+
+
+def validate_numpr_prefix(edits, index, alias_map, paragraph_style_templates):
+    """Error when new_text starts with a number prefix on an auto-numbered block.
+
+    Blocks with <w:numPr> have Word auto-generate number prefixes.
+    Including them in new_text causes double numbering (e.g. "1-1. 1-1. text").
+    """
+    issues = []
+    for i, edit in enumerate(edits):
+        tid = edit.get("target_id", "")
+        action = edit.get("action", "")
+        new_text = edit.get("new_text", "")
+
+        if action == "delete" or not new_text:
+            continue
+
+        has_numpr = False
+
+        if action == "replace":
+            m = _RE_BLOCK.match(tid)
+            if m:
+                bid = f"b{m.group(1)}"
+                block = index.id_to_block.get(bid)
+                if block and "numPr" in block.get("xml", ""):
+                    has_numpr = True
+
+        elif action in ("insert_after", "insert_before"):
+            tag = edit.get("semantic_tag", "")
+            if tag in PARAGRAPH_TAGS:
+                sa = edit.get("style_alias", "")
+                style_key = alias_map.get(sa, "")
+                pst = paragraph_style_templates.get(style_key, {})
+                ppr = pst.get("ppr_xml_template", "")
+                if "numPr" in ppr:
+                    has_numpr = True
+
+        if has_numpr and _RE_NUM_PREFIX.match(new_text):
+            issues.append(_err(
+                i, tid, "numpr_prefix",
+                "new_text starts with a number prefix but target has "
+                "auto-numbering (numPr). Remove the prefix — Word adds it "
+                "automatically."))
+
+    return issues
+
+
+def validate_toc_impact(edits, index):
+    """Warn when heading edits may require TOC update."""
+    issues = []
+    heading_tags = {"H1", "H2", "H3"}
+    heading_edit_idx = None
+
+    for i, edit in enumerate(edits):
+        tag = edit.get("semantic_tag", "")
+        action = edit.get("action", "")
+        if tag in heading_tags and action in (
+            "insert_after", "insert_before", "replace", "delete",
+        ):
+            heading_edit_idx = i
+            break
+
+    if heading_edit_idx is None:
+        return issues
+
+    # Check if document has TOC (SDT block)
+    has_toc = any(
+        b.get("type") == "sdt" for b in index.id_to_block.values()
+    )
+
+    if has_toc:
+        tid = edits[heading_edit_idx].get("target_id", "")
+        issues.append(_warn(
+            heading_edit_idx, tid, "toc_impact",
+            "Heading edits detected and document has TOC. "
+            "Update TOC entries via Section D (direct XML) after applying edits."))
+
+    return issues
+
+
+def validate_numpr_cascade(edits, index, alias_map, paragraph_style_templates):
+    """Warn when heading INSERT/DELETE may shift auto-numbering."""
+    issues = []
+    heading_tags = {"H1", "H2", "H3"}
+
+    for i, edit in enumerate(edits):
+        tid = edit.get("target_id", "")
+        action = edit.get("action", "")
+        tag = edit.get("semantic_tag", "")
+
+        if tag not in heading_tags:
+            continue
+        if action not in ("insert_after", "insert_before", "delete"):
+            continue
+
+        has_numpr = False
+
+        if action == "delete":
+            m = _RE_BLOCK.match(tid)
+            if m:
+                bid = f"b{m.group(1)}"
+                block = index.id_to_block.get(bid)
+                if block and "numPr" in block.get("xml", ""):
+                    has_numpr = True
+        else:
+            # INSERT: check if the style being used has numPr
+            sa = edit.get("style_alias", "")
+            style_key = alias_map.get(sa, "")
+            pst = paragraph_style_templates.get(style_key, {})
+            ppr = pst.get("ppr_xml_template", "")
+            if "numPr" in ppr:
+                has_numpr = True
+
+        if has_numpr:
+            issues.append(_warn(
+                i, tid, "numpr_cascade",
+                f"Heading {action} with auto-numbering will shift numbering "
+                f"for subsequent headings. Verify in Step 7 (re-analyze) and "
+                f"update TOC entries to match new numbering."))
+
+    return issues
+
+
 # -------------------------------------------------------------------
 # Orchestrator
 # -------------------------------------------------------------------
@@ -489,12 +662,16 @@ def validate(work_dir):
 
     all_issues = []
     all_issues.extend(validate_target_ids(edits, index))
+    all_issues.extend(validate_edit_unit_format(edits))
     all_issues.extend(validate_semantic_tags(edits, index))
     all_issues.extend(validate_style_aliases(edits, alias_map))
     all_issues.extend(validate_table_fields(edits, index))
     all_issues.extend(validate_newlines(edits))
     all_issues.extend(validate_column_counts(edits, index))
     all_issues.extend(validate_runs(edits, alias_map, pst))
+    all_issues.extend(validate_numpr_prefix(edits, index, alias_map, pst))
+    all_issues.extend(validate_toc_impact(edits, index))
+    all_issues.extend(validate_numpr_cascade(edits, index, alias_map, pst))
 
     for issue in all_issues:
         if issue.get("level") == "warning":
@@ -517,7 +694,7 @@ def main():
         sys.exit(1)
 
     result = validate(work_dir)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["valid"] else 1)
 
 

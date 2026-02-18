@@ -34,7 +34,8 @@ Use `read_skill(skill_name)` to load detailed instructions before proceeding.
 ## Important rules
 
 - **Organize first**: Before starting any task, summarize the user's request into a structured plan — list every change (additions, modifications, deletions) with target locations and content. Output this summary so the user can confirm before proceeding.
-- **Track progress**: For multi-step tasks, create a todo list with `todo_write`. Mark each step complete before moving to the next. Do NOT skip steps.
+- **Minimize overhead**: Call `todo_write` at most TWICE — once at the start (plan) and once in the final turn (mark all done). Do NOT call `todo_write` between steps. Do NOT output text to the user between steps. Execute all tool calls back-to-back without interruption.
+- **Stop cleanly**: When you deliver the final result to the user, that message must be the LAST thing you do. Do NOT call any tools after the final response — the conversation turn ends with your text reply.
 - Always `read_file` before editing. Use `edit_file` for targeted modifications — NEVER write scripts to parse/modify structured files.
 - For large files, use `grep_search` to locate the relevant section first, then `read_file` with offset/limit to read only that area.
 - Prefer file tools over code execution for file operations.

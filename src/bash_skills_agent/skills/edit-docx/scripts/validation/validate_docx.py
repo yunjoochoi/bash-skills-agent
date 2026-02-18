@@ -286,7 +286,7 @@ def main():
     work_dir = sys.argv[2] if len(sys.argv) >= 3 else None
 
     result = validate(docx_path, work_dir)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False))
     sys.exit(0 if result["valid"] else 1)
 
 

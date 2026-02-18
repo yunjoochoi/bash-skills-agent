@@ -143,8 +143,10 @@ async def extract_files_callback(
     workspace = get_session_workspace(session.id)
     events = session.events
 
-    # Only process new events since last run
-    for event in events[processed_idx:]:
+    # Process ALL events every turn — Part replacements are in-memory only
+    # and don't persist to DB, so binary Parts must be replaced each turn.
+    # The dedup check in _process_part prevents re-writing files to disk.
+    for event in events:
         if event.author != "user" or not event.content:
             continue
         event.content.parts = [

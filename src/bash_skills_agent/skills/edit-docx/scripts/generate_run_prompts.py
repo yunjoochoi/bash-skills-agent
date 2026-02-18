@@ -315,7 +315,7 @@ def main():
 
     work_dir = sys.argv[1]
     result = generate_prompts(work_dir)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -342,6 +342,88 @@ def _has_non_text_content(xml_str):
     return False
 
 
+def _extract_bookmarks_xml(xml_str):
+    """Extract bookmarkStart/End XML strings from a paragraph.
+
+    Args:
+        xml_str: Paragraph XML string.
+
+    Returns:
+        Tuple of (starts_list, ends_list) where each is a list of XML strings.
+    """
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError:
+        return [], []
+    ns_w = NAMESPACES["w"]
+    starts = [ET.tostring(e, encoding="unicode")
+              for e in root.findall(f"{{{ns_w}}}bookmarkStart")]
+    ends = [ET.tostring(e, encoding="unicode")
+            for e in root.findall(f"{{{ns_w}}}bookmarkEnd")]
+    return starts, ends
+
+
+def _inject_bookmarks_into_para(para_xml, bk_starts, bk_ends):
+    """Inject bookmark elements into a paragraph XML string.
+
+    Inserts bookmarkStart after pPr and bookmarkEnd at end of paragraph.
+
+    Args:
+        para_xml: Paragraph XML string.
+        bk_starts: List of bookmarkStart XML strings.
+        bk_ends: List of bookmarkEnd XML strings.
+
+    Returns:
+        Modified paragraph XML string.
+    """
+    if not bk_starts and not bk_ends:
+        return para_xml
+    try:
+        root = ET.fromstring(para_xml)
+        ns_w = NAMESPACES["w"]
+
+        # Find insert position (after pPr)
+        ppr = root.find(f"{{{ns_w}}}pPr")
+        children = list(root)
+        insert_idx = (children.index(ppr) + 1) if ppr is not None else 0
+
+        # Insert bookmarkStart elements (reverse to maintain order)
+        for bk_xml_str in reversed(bk_starts):
+            try:
+                root.insert(insert_idx, ET.fromstring(bk_xml_str))
+            except ET.ParseError:
+                pass
+
+        # Append bookmarkEnd elements at the end
+        for bk_xml_str in bk_ends:
+            try:
+                root.append(ET.fromstring(bk_xml_str))
+            except ET.ParseError:
+                pass
+
+        return ET.tostring(root, encoding="unicode")
+    except ET.ParseError:
+        return para_xml
+
+
+def _normalize_newlines(text):
+    """Normalize literal backslash-n to actual newlines.
+
+    Handles cases where JSON double-escaping produces literal \\n
+    instead of actual newline characters.
+
+    Args:
+        text: Input string.
+
+    Returns:
+        String with literal \\n replaced by actual newlines (if no real
+        newlines were present).
+    """
+    if "\n" not in text and "\\n" in text:
+        return text.replace("\\n", "\n")
+    return text
+
+
 def _replace_text_preserving_structure(original_xml, new_text):
     """In-place text replacement preserving paragraph structure.
 
@@ -524,6 +606,12 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 })
                 blocks[idx]["_replaced"] = True
                 blocks[idx].setdefault("_replacements", [])
+            elif is_col_insert_ia and not col_match_ia:
+                raise ValueError(
+                    f"Column insert_after requires bN:cN target_id format, "
+                    f"got '{nb['target_id']}'. sub_coord '{sub_coord}' does "
+                    f"not match 'c(\\d+)$'."
+                )
             else:
                 blocks[idx].setdefault("_inserts_after", []).append({
                     "style_key": nb.get("style_key", ""),
@@ -576,6 +664,12 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 })
                 blocks[idx]["_replaced"] = True
                 blocks[idx].setdefault("_replacements", [])
+            elif is_col_insert_ib and not col_match_ib:
+                raise ValueError(
+                    f"Column insert_before requires bN:cN target_id format, "
+                    f"got '{nb['target_id']}'. sub_coord '{sub_coord}' does "
+                    f"not match 'c(\\d+)$'."
+                )
             else:
                 blocks[idx].setdefault("_inserts_before", []).append({
                     "style_key": nb.get("style_key", ""),
@@ -1122,7 +1216,7 @@ def _table_delete_paragraph(table_xml, row_idx, col_idx, para_idx):
 
 def _table_add_column(table_xml, after_col_idx, col_contents,
                       cell_style_aliases, paragraph_style_templates,
-                      style_alias_map):
+                      style_alias_map, tst=None):
     """Add a new column to a table after the specified column.
 
     Uses CS aliases to build each cell via _build_cell_from_alias,
@@ -1204,6 +1298,7 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
                     gc.set(f"{{{ns_w}}}w", str(all_widths[i]))
 
         # Add new cell to each row
+        cst = tst.get("cell_style_templates", {}) if tst else {}
         for r_idx, tr in enumerate(xml_rows):
             cs_alias = (
                 cell_style_aliases[r_idx]
@@ -1213,9 +1308,21 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
             cell_content = (
                 col_contents[r_idx] if r_idx < len(col_contents) else ""
             )
+            # Look up cell paragraph styles (font info) from TST
+            cell_ps = None
+            if cst:
+                tc_xml_ref = style_alias_map.get(cs_alias, "")
+                for _row_key, cells in cst.items():
+                    for cell_entry in cells:
+                        if cell_entry.get("tc_xml_template") == tc_xml_ref:
+                            cell_ps = cell_entry.get("paragraph_styles")
+                            break
+                    if cell_ps:
+                        break
             new_cell = _build_cell_from_alias(
                 cs_alias, cell_content, new_col_width,
                 paragraph_style_templates, style_alias_map,
+                cell_para_styles=cell_ps,
             )
 
             row_children = list(tr)
@@ -1458,6 +1565,7 @@ def _build_cell_from_alias(cs_alias, text, col_width,
     """
     ns_w = NAMESPACES["w"]
     tc_xml = style_alias_map.get(cs_alias, "")
+    text = _normalize_newlines(text)
     lines = text.split("\n") if "\n" in text else [text]
 
     # Extract pPr and run template from cell paragraph styles (TST)
@@ -1557,7 +1665,8 @@ def _build_table_from_template(template, content,
 
     try:
         rows_content = []
-        for line in content.strip().split("\n"):
+        normalized = _normalize_newlines(content.strip())
+        for line in normalized.split("\n"):
             cells = [c.strip() for c in line.split("|")]
             rows_content.append(cells)
 
@@ -1734,6 +1843,10 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         pd["row_idx"], pd["col_idx"], pd["para_idx"],
                     )
 
+                # Look up TST for column inserts (font info)
+                tbl_style_key = block.get("style_key", "")
+                tbl_tst = table_style_templates.get(tbl_style_key, {})
+
                 # Column inserts after
                 col_inserts_after = block.get("_col_inserts_after", [])
                 for col_insert in sorted(
@@ -1741,6 +1854,7 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                 ):
                     c_idx = col_insert["col_idx"]
                     content = col_insert.get("content", "")
+                    content = _normalize_newlines(content) if content else ""
                     col_contents = (
                         [c.strip() for c in content.split("\n")]
                         if content else []
@@ -1750,6 +1864,7 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         current_xml = _table_add_column(
                             current_xml, c_idx, col_contents, cs_aliases,
                             paragraph_style_templates, style_alias_map,
+                            tst=tbl_tst,
                         )
                     else:
                         current_xml = _table_insert_column_paragraph(
@@ -1765,6 +1880,7 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                 ):
                     c_idx = col_insert["col_idx"]
                     content = col_insert.get("content", "")
+                    content = _normalize_newlines(content) if content else ""
                     col_contents = (
                         [c.strip() for c in content.split("\n")]
                         if content else []
@@ -1774,6 +1890,7 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         current_xml = _table_add_column(
                             current_xml, c_idx - 1, col_contents, cs_aliases,
                             paragraph_style_templates, style_alias_map,
+                            tst=tbl_tst,
                         )
                     else:
                         current_xml = _table_insert_column_paragraph(
@@ -1869,20 +1986,40 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                             original_xml, content,
                         ),
                     )
-                elif run_xmls:
-                    ppr = (
-                        template.get("ppr_xml_template")
-                        or f'<w:pPr xmlns:w="{ns}"/>'
-                    )
-                    xml = (
-                        f'<w:p xmlns:w="{ns}">'
-                        f'{ppr}{"".join(run_xmls)}</w:p>'
-                    )
-                    body_parts.append(xml)
                 else:
-                    _append_paragraphs_from_content(
-                        body_parts, template, content, ns,
+                    # Extract bookmarks from original paragraph
+                    # (TOC hyperlinks depend on these)
+                    bk_starts, bk_ends = _extract_bookmarks_xml(
+                        original_xml,
                     )
+
+                    if run_xmls:
+                        ppr = (
+                            template.get("ppr_xml_template")
+                            or f'<w:pPr xmlns:w="{ns}"/>'
+                        )
+                        bk_s = "".join(bk_starts)
+                        bk_e = "".join(bk_ends)
+                        xml = (
+                            f'<w:p xmlns:w="{ns}">'
+                            f'{ppr}{bk_s}{"".join(run_xmls)}{bk_e}'
+                            f'</w:p>'
+                        )
+                        body_parts.append(xml)
+                    else:
+                        start_idx = len(body_parts)
+                        _append_paragraphs_from_content(
+                            body_parts, template, content, ns,
+                        )
+                        # Inject bookmarks into the first paragraph
+                        if ((bk_starts or bk_ends)
+                                and len(body_parts) > start_idx):
+                            body_parts[start_idx] = (
+                                _inject_bookmarks_into_para(
+                                    body_parts[start_idx],
+                                    bk_starts, bk_ends,
+                                )
+                            )
         else:
             # Unmodified original block
             block_id_to_parts_idx[block["id"]] = len(body_parts)

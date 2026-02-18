@@ -119,7 +119,7 @@ bash(command="python3 /skills/edit-docx/scripts/validation/validate_docx.py /wor
 ```
 
 Validates the output DOCX structure and content. Outputs JSON with errors/warnings.
-- If `"valid": false` — review errors, fix edits.json, re-run from Step 3.
+- If `"valid": false` — review errors, fix ONLY the failing edits in edits.json, re-run from Step 3.
 - If `"valid": true` with warnings only — review warnings, proceed if acceptable.
 
 ### Step 7: Re-analyze & Verify
@@ -128,11 +128,27 @@ Validates the output DOCX structure and content. Outputs JSON with errors/warnin
 bash(command="python3 /skills/edit-docx/scripts/analyze_docx.py /workspace/<output.docx> /workspace/docx_work_verify")
 ```
 
-Re-run analyze on the OUTPUT DOCX and review the text_merge:
-1. Check that all user-requested changes are reflected in the new text_merge
-2. Verify numbering is correct (no duplication, correct sequence)
-3. Verify TOC entries match the body headings (if TOC was edited)
-4. If discrepancies found — identify the cause, fix, and re-run from the appropriate step
+Re-run analyze on the OUTPUT DOCX and review the text_merge.
+
+**Mandatory verification — check EVERY edit against the result:**
+
+For each edit in edits.json, verify by action type:
+- **INSERT**: The new content MUST appear as a **separate new block** in the verification text_merge. AND the original block at the target location MUST still be present (unchanged). If the original content is gone, you did REPLACE by mistake — redo as INSERT.
+- **REPLACE**: The target block must now contain the new_text. The total block count should NOT change from replacement alone.
+- **DELETE**: The target block must be absent from the verification text_merge.
+
+**Numbering check:**
+- If any numPr heading was inserted/deleted, compare before/after computed prefixes for ALL subsequent headings
+- Detect cascading shifts (e.g., original "1-5-2" became "1-5-3")
+
+**TOC check (if TOC exists):**
+- Each TOC entry text and bookmark anchor must match the corresponding body heading
+- Number prefixes in TOC must match the re-analyzed numPr computed values
+
+**If corrections needed** — use the OUTPUT as the new input and repeat from Step 1:
+- Remove successfully applied edits from edits.json
+- Add new corrective edits against the re-analyzed document
+- Repeat Steps 1→7 until the result matches the user's request
 
 ---
 
@@ -203,6 +219,7 @@ Fields: `action`, `target_id`, `semantic_tag`, `edit_unit`, `new_text`, `table_s
 - `|numPr:"1-5-1."` = Word auto-generates "1-5-1." before the text. The computed prefix is shown in quotes.
 - **DO NOT include number prefixes in `new_text`** — Word adds them automatically
 - Use the computed prefix when creating TOC entries for these blocks
+- **Numbering cascade**: Inserting/deleting headings with `numPr` shifts auto-numbering for ALL subsequent same-level headings. After heading INSERT/DELETE, re-analyze the output DOCX (Step 7) to verify correct numbering before updating TOC.
 
 ### One Block = One Edit
 - NEVER combine multiple styled elements into one edit
@@ -258,7 +275,10 @@ To insert a heading + body text after b10:
 
 ---
 
-## D. TOC (Table of Contents) Editing
+## D. TOC (Table of Contents) Editing — MANDATORY when headings change
+
+**CRITICAL**: If ANY heading (H1/H2/H3) was added, removed, or renamed, you MUST update the TOC.
+Skipping TOC update leaves stale/broken entries. validate_edits.py emits a `toc_impact` warning as a reminder.
 
 TOC editing is done via **direct XML manipulation** using bash, NOT through edits.json.
 
@@ -299,12 +319,29 @@ Use `lxml` for TOC XML manipulation. lxml preserves namespace prefixes and handl
    - **Add bookmark**: Insert `<w:bookmarkStart>` / `<w:bookmarkEnd>` around body heading
 4. Save with `tree.write()`
 
+### When to Edit TOC
+
+**Heading RENAME only** (REPLACE, no INSERT/DELETE): TOC can be updated in the same pass (between Step 4 and Step 5). The numPr values do not change.
+
+**Heading INSERT or DELETE**: TOC MUST be updated in a **second pass** because:
+1. Inserting/deleting a numPr heading shifts ALL subsequent headings' auto-numbering
+2. You cannot know the final numPr values until AFTER applying edits and re-analyzing
+3. Writing TOC entries with pre-edit numbers produces WRONG results (e.g., two "1-5-2." entries)
+
+**Second-pass workflow for heading INSERT/DELETE:**
+1. First pass: Apply body edits only (Steps 1→5), skip TOC
+2. Re-analyze output DOCX (Step 7) — read the NEW numPr values from text_merge
+3. Second pass: Use the output DOCX as new input, analyze it, then edit TOC XML using the re-analyzed numPr values
+4. Update ALL TOC entries whose numbering shifted — not just new entries
+5. Repack and verify
+
 ### Key Rules
 - TOC `<w:hyperlink w:anchor="name">` must match body `<w:bookmarkStart w:name="name">`
 - PAGEREF instrText must reference the same bookmark name
 - Bookmark IDs must be unique across the document
 - **DO NOT use `--update-fields` flag** when TOC was manually edited — it causes Word to rebuild the entire TOC from heading styles, wiping out manual XML entries
 - Page numbers in manually added entries are static placeholders
+- **Number prefixes in TOC entries MUST match the re-analyzed numPr computed values** — never use pre-edit numbering
 
 ---
 
@@ -354,13 +391,17 @@ Before writing edits.json, verify:
 6. No `\n` in paragraph `new_text`
 7. `new_text` is COMPLETE content
 8. TOC edits are NOT in edits.json (handle via direct XML — see Section D)
+9. `new_text` does NOT start with number prefixes on `numPr` blocks — Word adds them
+10. Row REPLACE cell count (pipe-separated) matches table column count
+11. **If heading edits exist AND document has TOC → TOC update is MANDATORY (Section D)**
 
 Execution order (MUST follow):
-9. Write `edits.json` (Step 2)
-11. Run `validation/validate_edits.py` (Step 3) — fix errors and re-validate until valid
-12. Run `generate_run_prompts.py` AFTER edits.json is finalized (Step 3.5) — process prompts if any
-13. Run `apply_edits.py` (Step 4)
-14. Edit TOC XML directly if needed (Section D)
-15. Run `repack_docx.py` (Step 5) — **without** `--update-fields` if TOC was manually edited
-16. Run `validation/validate_docx.py` (Step 6) — verify output DOCX
-17. Re-analyze output DOCX (Step 7) — verify text_merge matches user request
+1. Write `edits.json` (Step 2)
+2. Run `validation/validate_edits.py` (Step 3) — fix errors and re-validate until valid
+3. Run `generate_run_prompts.py` AFTER edits.json is finalized (Step 3.5) — process prompts if any
+4. Run `apply_edits.py` (Step 4)
+5. Edit TOC XML directly **ONLY if heading RENAME only** (Section D) — skip if heading INSERT/DELETE
+6. Run `repack_docx.py` (Step 5) — **without** `--update-fields` if TOC was manually edited
+7. Run `validation/validate_docx.py` (Step 6) — verify output DOCX
+8. Re-analyze output DOCX (Step 7) — verify text_merge matches user request
+9. **If heading INSERT/DELETE AND document has TOC**: start second pass — use output as new input, edit TOC with re-analyzed numPr values (Section D), repack, re-verify
