@@ -1,4 +1,6 @@
-"""Web fetch tool - retrieve and extract text content from a URL."""
+"""Web fetch tool — retrieve and extract text content from a URL."""
+
+from __future__ import annotations
 
 import logging
 from typing import Any
@@ -6,42 +8,46 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
+from ..config.settings import settings
+
 logger = logging.getLogger(__name__)
 
-_TIMEOUT = 15
-_MAX_CONTENT_LENGTH = 50_000
+_STRIP_TAGS = ("script", "style", "nav", "footer", "header", "noscript")
 
 
-def _html_to_text(html: str) -> str:
-    """Extract clean text from HTML using BeautifulSoup."""
+def _parse_html(html: str) -> tuple[str, str]:
+    """Parse HTML and return (clean_text, title)."""
     soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+    for tag in soup(_STRIP_TAGS):
         tag.decompose()
 
     text = soup.get_text(separator="\n", strip=True)
-
-    # Collapse excessive blank lines
     lines = [line for line in text.splitlines() if line.strip()]
-    return "\n".join(lines)
+    return "\n".join(lines), title
 
 
 async def web_fetch(
     url: str,
-    max_length: int = _MAX_CONTENT_LENGTH,
+    max_length: int = 0,
 ) -> dict[str, Any]:
     """Fetch a web page and return its text content.
 
     Args:
-        url: The URL to fetch
-        max_length: Maximum character length of returned content (default: 50000)
+        url: The URL to fetch.
+        max_length: Maximum character length of returned content.
+                    Defaults to settings.web_fetch_max_length.
 
     Returns:
-        Dictionary with url, title, and content (or error)
+        Dictionary with url, title, and content (or error).
     """
+    if max_length <= 0:
+        max_length = settings.web_fetch_max_length
+
     try:
         async with httpx.AsyncClient(
-            timeout=_TIMEOUT,
+            timeout=settings.web_fetch_timeout,
             follow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0 (compatible; BashSkillsAgentBot/1.0)"},
         ) as client:
@@ -51,12 +57,9 @@ async def web_fetch(
         content_type = resp.headers.get("content-type", "")
 
         if "html" in content_type:
-            text = _html_to_text(resp.text)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            title = soup.title.string.strip() if soup.title and soup.title.string else ""
+            text, title = _parse_html(resp.text)
         else:
-            text = resp.text
-            title = ""
+            text, title = resp.text, ""
 
         if len(text) > max_length:
             text = text[:max_length] + f"\n\n... (truncated, {len(text)} total chars)"

@@ -1,6 +1,5 @@
 """Application settings using Pydantic Settings."""
 
-import logging
 import os
 import warnings
 
@@ -16,7 +15,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Model configuration
+    # Model
     litellm_model: str = "vertex_ai.gemini-3.0-flash-preview"
 
     # LiteLLM Proxy (env: OPENAI_API_KEY, OPENAI_API_BASE)
@@ -42,6 +41,11 @@ class Settings(BaseSettings):
     # Skills
     skills_dir: str = ""
 
+    # Web tools
+    web_fetch_timeout: int = 15
+    web_fetch_max_length: int = 50_000
+    web_search_region: str = "kr-kr"
+
     # MCP
     mcp_servers: str = ""
 
@@ -52,14 +56,8 @@ class Settings(BaseSettings):
         if self.openai_api_key:
             os.environ["OPENAI_API_KEY"] = self.openai_api_key
 
-    def configure_logging(self) -> None:
-        """Configure logging for the application."""
-        logging.basicConfig(level=self.log_level)
-        # Suppress noisy Pydantic serialization warnings from LiteLLM
-        warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
-
 
 # Global settings instance
 settings = Settings()
 settings.configure_litellm_proxy()
-settings.configure_logging()
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")

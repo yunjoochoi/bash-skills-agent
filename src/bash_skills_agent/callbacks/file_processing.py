@@ -11,17 +11,14 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 
-_turn_counter: dict[str, int] = {}  # session_id → turn count
-
-
 async def log_reasoning_callback(
     callback_context: CallbackContext,
     llm_response,
 ) -> None:
     """Log turn info and reasoning content from LLM response."""
-    session_id = callback_context.session.id
-    _turn_counter[session_id] = _turn_counter.get(session_id, 0) + 1
-    turn = _turn_counter[session_id]
+    prev = callback_context.session.state.get("_turn_count", 0)
+    turn = prev + 1
+    callback_context.state["_turn_count"] = turn
 
     # Log tool calls in this turn
     content = getattr(llm_response, "content", None)
@@ -115,8 +112,8 @@ async def _process_part(
     # Save as ADK artifact (versioned)
     version = None
     try:
-        docx_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        artifact_part = types.Part(inline_data=types.Blob(mime_type=docx_mime, data=data))
+        blob = types.Blob(mime_type=_DOCX_MIME, data=data)
+        artifact_part = types.Part(inline_data=blob)
         version = await callback_context.save_artifact(safe_name, artifact_part)
     except ValueError as e:
         logger.warning("Artifact service not available: %s", e)
@@ -138,7 +135,6 @@ async def extract_files_callback(
 
     session = callback_context.session
     uploaded: list[dict] = list(session.state.get("uploaded_files", []))
-    processed_idx: int = session.state.get("_files_processed_idx", 0)
 
     workspace = get_session_workspace(session.id)
     events = session.events
@@ -162,7 +158,6 @@ async def extract_files_callback(
             mtimes[info["file_name"]] = os.path.getmtime(fp)
     callback_context.state["_workspace_mtimes"] = mtimes
 
-    callback_context.state["_files_processed_idx"] = len(events)
     if uploaded:
         callback_context.state["uploaded_files"] = uploaded
 
@@ -171,8 +166,10 @@ async def extract_files_callback(
 # Output artifact callback
 # =====================================================================
 
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
 _ARTIFACT_EXTENSIONS = {
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".docx": _DOCX_MIME,
     ".pdf": "application/pdf",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",

@@ -3,13 +3,15 @@
 import logging
 from typing import Any
 
+from ..config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 
 async def search_web(
     query: str,
     num_results: int = 5,
-    region: str = "kr-kr",
+    region: str = "",
 ) -> dict[str, Any]:
     """Search the web using DuckDuckGo.
 
@@ -29,6 +31,8 @@ async def search_web(
     except ImportError:
         return {"error": "duckduckgo-search not installed. Run: pip install duckduckgo-search"}
 
+    if not region:
+        region = settings.web_search_region
     num_results = min(num_results, 10)
 
     try:

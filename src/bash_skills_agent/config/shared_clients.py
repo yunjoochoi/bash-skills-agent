@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from google.adk.sessions import (
     DatabaseSessionService,
     InMemorySessionService,
 )
-from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import (
     SseConnectionParams,
     StdioConnectionParams,
     StreamableHTTPConnectionParams,
 )
+from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 
 from .settings import settings
+
+if TYPE_CHECKING:
+    from ..container.manager import ContainerManager
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +53,10 @@ def get_session_service():
                 )
             _session_service = DatabaseSessionService(db_uri=settings.postgres_uri)
         elif settings.session_service_type == "sqlite":
-            # Ensure parent directory exists for SQLite database
-            db_dir = os.path.dirname(settings.sqlite_db_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir, exist_ok=True)
+            db_path = Path(settings.sqlite_db_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            db_uri = f"sqlite:///{settings.sqlite_db_path}"
+            db_uri = f"sqlite:///{db_path}"
             _session_service = DatabaseSessionService(db_uri=db_uri)
         elif settings.session_service_type == "inmemory":
             _session_service = InMemorySessionService()
@@ -68,20 +70,19 @@ def get_session_service():
 
 def resolve_skills_dir() -> str:
     """Resolve the skills directory path from settings or default."""
-    skills_dir = settings.skills_dir
-    if not skills_dir:
-        skills_dir = str(os.path.join(os.path.dirname(__file__), "..", "skills"))
-    return os.path.abspath(skills_dir)
+    if settings.skills_dir:
+        return str(Path(settings.skills_dir).resolve())
+    return str((Path(__file__).parent.parent / "skills").resolve())
 
 
 def get_session_workspace(session_id: str) -> str:
     """Return session-isolated workspace path on host."""
-    workspace = os.path.join(os.path.abspath(settings.user_files_path), session_id)
-    os.makedirs(workspace, exist_ok=True)
-    return workspace
+    workspace = Path(settings.user_files_path).resolve() / session_id
+    workspace.mkdir(parents=True, exist_ok=True)
+    return str(workspace)
 
 
-def get_container_manager(session_id: str):
+def get_container_manager(session_id: str) -> "ContainerManager":
     """Return per-session ContainerManager (lazy-created)."""
     if session_id not in _container_managers:
         from ..container.manager import ContainerManager
