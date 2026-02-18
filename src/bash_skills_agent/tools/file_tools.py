@@ -91,17 +91,19 @@ async def edit_file(
     file_path: str,
     old_text: str,
     new_text: str,
+    replace_all: bool = False,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Replace an exact text block in a file.
 
     Args:
         file_path: Path to the file (/workspace/... or absolute)
-        old_text: Text to find (must be unique in the file)
+        old_text: Text to find (must be unique unless replace_all=True)
         new_text: Replacement text
+        replace_all: Replace all occurrences (default: False)
 
     Returns:
-        Dict with success status
+        Dict with success status and replacement count
     """
     p = _resolve_path(file_path, tool_context)
     if not p.is_file():
@@ -112,11 +114,14 @@ async def edit_file(
         count = text.count(old_text)
         if count == 0:
             return {"error": "old_text not found in file"}
-        if count > 1:
-            return {"error": f"old_text found {count} times — must be unique"}
+        if not replace_all and count > 1:
+            return {"error": f"old_text found {count} times — must be unique (use replace_all=True to replace all)"}
 
-        p.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
-        return {"success": True, "path": str(p.resolve())}
+        if replace_all:
+            p.write_text(text.replace(old_text, new_text), encoding="utf-8")
+        else:
+            p.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        return {"success": True, "path": str(p.resolve()), "replacements": count if replace_all else 1}
     except Exception as e:
         return {"error": str(e)}
 
@@ -150,6 +155,10 @@ async def grep_search(
     pattern: str,
     path: str = "/workspace",
     glob: str | None = None,
+    output_mode: str = "content",
+    ignore_case: bool = False,
+    context_lines: int = 0,
+    head_limit: int = 0,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Search file contents with regex.
@@ -158,39 +167,92 @@ async def grep_search(
         pattern: Regex pattern to search for
         path: File or directory to search in (default: /workspace)
         glob: Optional glob filter for file names (e.g., "*.py")
+        output_mode: "content" (matching lines), "files_with_matches" (file paths only),
+                     "count" (match counts per file)
+        ignore_case: Ignore case when matching (default: False)
+        context_lines: Number of lines to show before and after each match (default: 0)
+        head_limit: Limit output to first N entries (default: 0 = unlimited, capped at 500)
 
     Returns:
-        Dict with matching files and lines
+        Dict with matches (format depends on output_mode) and total count
     """
     p = _resolve_path(path, tool_context)
+    flags = re.IGNORECASE if ignore_case else 0
     try:
-        regex = re.compile(pattern)
+        regex = re.compile(pattern, flags)
     except re.error as e:
         return {"error": f"Invalid regex: {e}"}
 
-    results: list[dict] = []
+    max_results = min(head_limit, 500) if head_limit > 0 else 500
 
-    def _search_file(fp: Path) -> None:
-        try:
-            for i, line in enumerate(fp.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
-                if regex.search(line):
-                    results.append({"file": str(fp), "line": i, "text": line.rstrip()[:500]})
-        except Exception:
-            pass
-
+    # Collect target files
+    files_to_search: list[Path] = []
     if p.is_file():
-        _search_file(p)
+        files_to_search.append(p)
     elif p.is_dir():
-        for root, _, files in os.walk(p):
-            for name in files:
+        for root_dir, _, filenames in os.walk(p):
+            for name in filenames:
                 if glob and not fnmatch.fnmatch(name, glob):
                     continue
-                _search_file(Path(root) / name)
-                if len(results) >= 500:
-                    break
-            if len(results) >= 500:
-                break
+                files_to_search.append(Path(root_dir) / name)
     else:
         return {"error": f"Path not found: {path}"}
+
+    if output_mode == "files_with_matches":
+        matched_files: list[str] = []
+        for fp in files_to_search:
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                if regex.search(text):
+                    matched_files.append(str(fp))
+                    if len(matched_files) >= max_results:
+                        break
+            except Exception:
+                pass
+        return {"matches": matched_files, "total": len(matched_files)}
+
+    if output_mode == "count":
+        counts: list[dict] = []
+        for fp in files_to_search:
+            try:
+                text = fp.read_text(encoding="utf-8", errors="replace")
+                n = len(regex.findall(text))
+                if n > 0:
+                    counts.append({"file": str(fp), "count": n})
+                    if len(counts) >= max_results:
+                        break
+            except Exception:
+                pass
+        return {"matches": counts, "total": len(counts)}
+
+    # output_mode == "content" (default)
+    results: list[dict] = []
+    for fp in files_to_search:
+        try:
+            lines = fp.read_text(
+                encoding="utf-8", errors="replace",
+            ).splitlines()
+            for i, line in enumerate(lines):
+                if regex.search(line):
+                    entry: dict[str, Any] = {
+                        "file": str(fp),
+                        "line": i + 1,
+                        "text": line.rstrip()[:500],
+                    }
+                    if context_lines > 0:
+                        start = max(0, i - context_lines)
+                        end = min(len(lines), i + context_lines + 1)
+                        ctx = [
+                            f"{j + 1}: {lines[j].rstrip()[:500]}"
+                            for j in range(start, end)
+                        ]
+                        entry["context"] = ctx
+                    results.append(entry)
+                    if len(results) >= max_results:
+                        break
+        except Exception:
+            pass
+        if len(results) >= max_results:
+            break
 
     return {"matches": results, "total": len(results)}

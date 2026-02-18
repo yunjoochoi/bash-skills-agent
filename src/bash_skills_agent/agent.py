@@ -17,17 +17,16 @@ from .config.settings import settings
 from .config.shared_clients import build_mcp_toolsets
 from .utils import load_all_skill_frontmatters
 from .tools import (
-    read_file,
-    write_file,
+    bash,
     edit_file,
     glob_search,
     grep_search,
-    bash,
-    sample_tool,
+    read_file,
+    search_web,
     skill_tool,
     todo_write,
     web_fetch,
-    search_web,
+    write_file,
 )
 from .callbacks import (
     after_tool_modifier,
@@ -58,7 +57,6 @@ def create_root_agent() -> Agent:
         todo_write,
         # Skills
         skill_tool,
-        sample_tool,
     ]
 
     # MCP connectors

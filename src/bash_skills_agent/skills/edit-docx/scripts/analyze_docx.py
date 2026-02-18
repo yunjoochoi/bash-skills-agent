@@ -58,7 +58,7 @@ _IGNORED_RPR_TAGS = frozenset({
 # State namespace (replaces instance variables from the class)
 # ============================================================================
 
-class _AnalyzerState:
+class AnalyzerState:
     """Mutable state for table deduplication caches.
 
     Replaces DocxAnalyzer instance variables.
@@ -644,7 +644,8 @@ def _extract_table_hierarchy(tbl_element, state):
 
     Args:
         tbl_element: Table XML element
-        state: _AnalyzerState instance
+        state: 
+    AnalyzerState instance
 
     Returns:
         Tuple of (table_template_dict, row_style_aliases, cell_style_map)
@@ -1163,7 +1164,8 @@ def parse_document_blocks(extracted_path, state):
 
     Args:
         extracted_path: Path to extracted XMLs directory
-        state: _AnalyzerState instance
+        state: 
+    AnalyzerState instance
 
     Returns:
         List of block dicts
@@ -1328,7 +1330,8 @@ def _generate_hierarchical_table_text(
         style_key_to_alias: Existing style_key -> alias mapping
         style_alias_map: Existing alias -> style_key mapping
         alias_counter: Current alias counter
-        state: _AnalyzerState instance
+        state: 
+    AnalyzerState instance
 
     Returns:
         Dict with 'lines' and 'next_alias_counter'
@@ -1488,7 +1491,8 @@ def generate_text_merge(parsed_result, state, num_prefix_map=None):
 
     Args:
         parsed_result: List of parsed block dicts
-        state: _AnalyzerState instance
+        state: 
+    AnalyzerState instance
         num_prefix_map: Optional dict mapping block_id to computed number prefix
 
     Returns:
@@ -1603,7 +1607,7 @@ def analyze(docx_path, work_dir):
     Returns:
         Dict containing all analysis results
     """
-    state = _AnalyzerState()
+    state = AnalyzerState()
     extracted_path = os.path.join(work_dir, "extracted")
 
     # Step 1: Extract XML from DOCX
@@ -1646,10 +1650,6 @@ def analyze(docx_path, work_dir):
 
     return output
 
-
-# ============================================================================
-# CLI Entry Point
-# ============================================================================
 
 def main():
     """CLI entry point: python3 analyze_docx.py <docx_path> <work_dir>"""

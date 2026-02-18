@@ -1678,9 +1678,26 @@ def _build_table_from_template(template, content,
 
         root = ET.fromstring(template["tbl_xml_template"])
 
-        # Get column widths
+        # Remove existing template rows — we generate all rows below
+        for old_tr in root.findall("w:tr", NAMESPACES):
+            root.remove(old_tr)
+
+        # Rebuild tblGrid for actual column count
         total_width = _get_table_total_width(root)
         tbl_grid = root.find("w:tblGrid", NAMESPACES)
+        if tbl_grid is not None:
+            existing_gc = tbl_grid.findall("w:gridCol", NAMESPACES)
+            # If template has fewer columns, distribute evenly
+            if len(existing_gc) != num_cols:
+                for gc in existing_gc:
+                    tbl_grid.remove(gc)
+                col_w = total_width // num_cols
+                remainder = total_width - col_w * num_cols
+                for i in range(num_cols):
+                    gc = ET.Element(f"{{{ns_w}}}gridCol")
+                    w = col_w + (1 if i < remainder else 0)
+                    gc.set(f"{{{ns_w}}}w", str(w))
+                    tbl_grid.append(gc)
         col_widths = _extract_column_widths(tbl_grid, num_cols, total_width)
 
         # Build RS alias -> TST row_styles index mapping
