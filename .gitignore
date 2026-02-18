@@ -27,6 +27,7 @@ venv/
 ENV/
 env/
 src/bash_skills_agent/skills/docx/
+python-docx/
 # Environment variables
 .env
 .env.local
