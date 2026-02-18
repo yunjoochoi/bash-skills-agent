@@ -854,6 +854,268 @@ def _infer_semantic_info(block, styles_xml_path):
 
 
 # ============================================================================
+# Numbering Computation
+# ============================================================================
+
+def _parse_numbering_xml(extracted_path):
+    """Parse numbering.xml and build numbering definitions.
+
+    Reads abstractNum definitions (level formats) and num instances
+    (numId -> abstractNumId mapping with optional start overrides).
+
+    Args:
+        extracted_path: Path to extracted XMLs directory
+
+    Returns:
+        Dict with abstract_nums and num_map, or None if file missing
+    """
+    numbering_path = os.path.join(extracted_path, "word", "numbering.xml")
+    if not os.path.exists(numbering_path):
+        return None
+
+    try:
+        tree = ET.parse(numbering_path)
+    except ET.ParseError:
+        return None
+
+    root = tree.getroot()
+    w = W_NS
+
+    abstract_nums = {}
+    for an in root.findall(f".//{{{w}}}abstractNum"):
+        aid = an.get(f"{{{w}}}abstractNumId")
+        if not aid:
+            continue
+        levels = {}
+        for lvl in an.findall(f"{{{w}}}lvl"):
+            ilvl_str = lvl.get(f"{{{w}}}ilvl")
+            if ilvl_str is None:
+                continue
+            ilvl = int(ilvl_str)
+
+            start_elem = lvl.find(f"{{{w}}}start")
+            start = (
+                int(start_elem.get(f"{{{w}}}val", "1"))
+                if start_elem is not None else 1
+            )
+
+            fmt_elem = lvl.find(f"{{{w}}}numFmt")
+            num_fmt = (
+                fmt_elem.get(f"{{{w}}}val", "decimal")
+                if fmt_elem is not None else "decimal"
+            )
+
+            text_elem = lvl.find(f"{{{w}}}lvlText")
+            lvl_text = (
+                text_elem.get(f"{{{w}}}val", "")
+                if text_elem is not None else ""
+            )
+
+            levels[ilvl] = {
+                "start": start,
+                "numFmt": num_fmt,
+                "lvlText": lvl_text,
+            }
+
+        abstract_nums[aid] = levels
+
+    num_map = {}
+    for num in root.findall(f".//{{{w}}}num"):
+        nid = num.get(f"{{{w}}}numId")
+        if not nid:
+            continue
+        anid_elem = num.find(f"{{{w}}}abstractNumId")
+        anid = (
+            anid_elem.get(f"{{{w}}}val")
+            if anid_elem is not None else None
+        )
+
+        overrides = {}
+        for ov in num.findall(f"{{{w}}}lvlOverride"):
+            ov_ilvl = ov.get(f"{{{w}}}ilvl")
+            if ov_ilvl is None:
+                continue
+            start_ov = ov.find(f"{{{w}}}startOverride")
+            if start_ov is not None:
+                overrides[int(ov_ilvl)] = int(
+                    start_ov.get(f"{{{w}}}val", "1")
+                )
+
+        num_map[nid] = {"abstractNumId": anid, "overrides": overrides}
+
+    return {"abstract_nums": abstract_nums, "num_map": num_map}
+
+
+def _format_number(value, num_fmt):
+    """Format a counter value according to Word numFmt.
+
+    Args:
+        value: Integer counter value
+        num_fmt: Format string (decimal, lowerLetter, upperLetter,
+                 lowerRoman, upperRoman, bullet, etc.)
+
+    Returns:
+        Formatted string
+    """
+    if num_fmt == "decimal":
+        return str(value)
+    if num_fmt == "lowerLetter":
+        return chr(ord("a") + (value - 1) % 26) if value >= 1 else str(value)
+    if num_fmt == "upperLetter":
+        return chr(ord("A") + (value - 1) % 26) if value >= 1 else str(value)
+    if num_fmt in ("lowerRoman", "upperRoman"):
+        pairs = [
+            (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+            (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+            (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+        ]
+        result = ""
+        remaining = value
+        for threshold, numeral in pairs:
+            while remaining >= threshold:
+                result += numeral
+                remaining -= threshold
+        return result.upper() if num_fmt == "upperRoman" else result
+    if num_fmt == "bullet":
+        return ""
+    return str(value)
+
+
+def _compute_effective_numbering(blocks, numbering_defs):
+    """Compute effective numbering prefix for each block with numPr.
+
+    Walks blocks in document order, maintaining counters per numId.
+    When ilvl goes to same or shallower level, deeper level counters reset.
+
+    Args:
+        blocks: List of block dicts (document order)
+        numbering_defs: Output from _parse_numbering_xml()
+
+    Returns:
+        Dict mapping block_id to computed number prefix string
+    """
+    if numbering_defs is None:
+        return {}
+
+    abstract_nums = numbering_defs["abstract_nums"]
+    num_map = numbering_defs["num_map"]
+
+    # Per-numId state:
+    #   counters: {ilvl: counter_value} — init to start-1, incremented on use
+    #   used: {ilvl: bool} — tracks which levels were directly used
+    #   last_ilvl: last ilvl used
+    counters = {}
+    used = {}
+    last_ilvl = {}
+    result = {}
+
+    for block in blocks:
+        if block["type"] != "p":
+            continue
+
+        style_key = block.get("style_key", "")
+        if "numPr" not in style_key:
+            continue
+
+        # Extract numId and ilvl from paragraph XML
+        try:
+            p_elem = ET.fromstring(block["xml"])
+        except ET.ParseError:
+            continue
+
+        p_pr = p_elem.find("w:pPr", NAMESPACES)
+        if p_pr is None:
+            continue
+
+        num_pr = p_pr.find("w:numPr", NAMESPACES)
+        if num_pr is None:
+            continue
+
+        ilvl_elem = num_pr.find("w:ilvl", NAMESPACES)
+        numid_elem = num_pr.find("w:numId", NAMESPACES)
+        if ilvl_elem is None or numid_elem is None:
+            continue
+
+        ilvl = int(ilvl_elem.get(f"{{{W_NS}}}val", "0"))
+        num_id = numid_elem.get(f"{{{W_NS}}}val", "0")
+
+        # Skip numId=0 (means no numbering)
+        if num_id == "0":
+            continue
+
+        # Resolve abstractNumId
+        if num_id not in num_map:
+            continue
+        abstract_num_id = num_map[num_id]["abstractNumId"]
+        if abstract_num_id is None or abstract_num_id not in abstract_nums:
+            continue
+
+        levels = abstract_nums[abstract_num_id]
+        overrides = num_map[num_id].get("overrides", {})
+
+        # Initialize counters for this numId on first use
+        if num_id not in counters:
+            counters[num_id] = {}
+            used[num_id] = {}
+            for lvl_idx, lvl_def in levels.items():
+                start = overrides.get(lvl_idx, lvl_def["start"])
+                counters[num_id][lvl_idx] = start - 1
+                used[num_id][lvl_idx] = False
+            last_ilvl[num_id] = -1
+
+        # Reset deeper levels when at same or shallower level
+        prev_ilvl = last_ilvl.get(num_id, -1)
+        if ilvl <= prev_ilvl:
+            for reset_lvl in range(ilvl + 1, 9):
+                if reset_lvl in levels:
+                    start = overrides.get(reset_lvl, levels[reset_lvl]["start"])
+                    counters[num_id][reset_lvl] = start - 1
+                    used[num_id][reset_lvl] = False
+
+        # Increment current level counter and mark as used
+        if ilvl not in counters[num_id]:
+            counters[num_id][ilvl] = 0
+        counters[num_id][ilvl] += 1
+        used[num_id][ilvl] = True
+        last_ilvl[num_id] = ilvl
+
+        # Get level definition
+        if ilvl not in levels:
+            continue
+
+        lvl_def = levels[ilvl]
+        num_fmt = lvl_def["numFmt"]
+        lvl_text = lvl_def["lvlText"]
+
+        if num_fmt == "bullet":
+            # Bullet: use lvlText character directly
+            result[block["id"]] = lvl_text if lvl_text else ""
+        else:
+            # Numbered: substitute %1, %2, etc. with counter values
+            # For levels never directly used, show their start value
+            # (Word renders parent level counters even if unused)
+            prefix = lvl_text
+            for ref_lvl in range(9):
+                placeholder = f"%{ref_lvl + 1}"
+                if placeholder in prefix:
+                    if used[num_id].get(ref_lvl, False):
+                        counter_val = counters[num_id].get(ref_lvl, 0)
+                    else:
+                        # Parent level never used: show start value
+                        ref_start = overrides.get(
+                            ref_lvl,
+                            levels.get(ref_lvl, {}).get("start", 1),
+                        )
+                        counter_val = ref_start
+                    ref_fmt = levels.get(ref_lvl, {}).get("numFmt", "decimal")
+                    formatted = _format_number(counter_val, ref_fmt)
+                    prefix = prefix.replace(placeholder, formatted)
+            result[block["id"]] = prefix
+
+    return result
+
+
+# ============================================================================
 # Core Pipeline
 # ============================================================================
 
@@ -1215,17 +1477,19 @@ def _extract_table_text_with_styles(
     }
 
 
-def generate_text_merge(parsed_result, state):
+def generate_text_merge(parsed_result, state, num_prefix_map=None):
     """Generate text merge string for LLM input with style aliases.
 
     Creates a text representation with block IDs and style aliases.
     Uses short aliases (S1, S2) to save tokens, with mapping stored separately.
 
     Format: [bN:TAG|S1] text content
+    For auto-numbered blocks: [bN:TAG|S1|numPr:"1-5-1."] text content
 
     Args:
         parsed_result: List of parsed block dicts
         state: _AnalyzerState instance
+        num_prefix_map: Optional dict mapping block_id to computed number prefix
 
     Returns:
         Tuple of (text_merge, style_alias_map)
@@ -1263,7 +1527,13 @@ def generate_text_merge(parsed_result, state):
             block["type"] == "p"
             and "numPr" in block.get("style_key", "")
         )
-        numpr_flag = "|numPr" if has_numpr else ""
+        if has_numpr and num_prefix_map:
+            prefix = num_prefix_map.get(block["id"], "")
+            numpr_flag = f'|numPr:"{prefix}"' if prefix else "|numPr"
+        elif has_numpr:
+            numpr_flag = "|numPr"
+        else:
+            numpr_flag = ""
 
         # Build block marker with semantic tag and alias
         if block["semantic_tag"]:
@@ -1345,8 +1615,14 @@ def analyze(docx_path, work_dir):
     # Step 3: Build paragraph style templates
     paragraph_templates = build_paragraph_style_templates(parsed_result)
 
+    # Step 3.5: Compute effective numbering from numbering.xml
+    numbering_defs = _parse_numbering_xml(extracted_path)
+    num_prefix_map = _compute_effective_numbering(parsed_result, numbering_defs)
+
     # Step 4: Generate text merge
-    text_merge, style_alias_map = generate_text_merge(parsed_result, state)
+    text_merge, style_alias_map = generate_text_merge(
+        parsed_result, state, num_prefix_map
+    )
 
     # Build output dict (all plain dicts, no Pydantic)
     serializable_blocks = list(parsed_result)

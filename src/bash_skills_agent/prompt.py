@@ -33,9 +33,10 @@ Use `read_skill(skill_name)` to load detailed instructions before proceeding.
 
 ## Important rules
 
+- **Organize first**: Before starting any task, summarize the user's request into a structured plan — list every change (additions, modifications, deletions) with target locations and content. Output this summary so the user can confirm before proceeding.
+- **Track progress**: For multi-step tasks, create a todo list with `todo_write`. Mark each step complete before moving to the next. Do NOT skip steps.
 - Always `read_file` before editing. Use `edit_file` for targeted modifications — NEVER write scripts to parse/modify structured files.
 - For large files, use `grep_search` to locate the relevant section first, then `read_file` with offset/limit to read only that area.
-- For multi-step tasks, create a todo list with `todo_write` first.
 - Prefer file tools over code execution for file operations.
 - Skills are loaded via `read_skill` — follow their instructions exactly.
 """

@@ -33,8 +33,8 @@ Read the text_merge output from Step 1. It shows document structure like:
 [b0:H1|S1] Chapter 1: Introduction
 [b1:BODY|S2] This is the first paragraph of body text.
 [b2:BODY|S2] Second paragraph with details.
-[b3:BODY|S5|numPr] Main requirements
-[b4:BODY|S6|numPr] - First bullet item
+[b3:BODY|S5|numPr:"1-1."] Main requirements
+[b4:BODY|S6|numPr:"•"] First bullet item
 [b5:TBL|T1]
   [b5:r0|RS0]
     [b5:r0c0|CS0] [p0|S3] Header1
@@ -47,7 +47,9 @@ Read the text_merge output from Step 1. It shows document structure like:
   [b6:p1] 1-1. Background 4
 ```
 
-- `|numPr` = style has auto-numbering (Word generates numbers/bullets automatically)
+- `|numPr:"1-1."` = auto-numbering with computed prefix (Word renders "1-1." before the text)
+- `|numPr:"•"` = auto bullet
+- `|numPr` (no value) = auto-numbering detected but prefix could not be computed
 
 Based on user's request, write an edit plan JSON to `/workspace/docx_work/edits.json`:
 
@@ -62,11 +64,11 @@ Based on user's request, write an edit plan JSON to `/workspace/docx_work/edits.
 ### Step 3: Validate Edit Plan
 
 ```
-bash(command="python3 /skills/edit-docx/scripts/validate_edits.py /workspace/docx_work")
+bash(command="python3 /skills/edit-docx/scripts/validation/validate_edits.py /workspace/docx_work")
 ```
 
 Validates edits.json against analysis.json. Outputs JSON with errors/warnings.
-- If `"valid": false` — fix edits.json based on error messages and re-validate.
+- If `"valid": false` — fix ONLY the failing edits in edits.json (use `edit_file`, do NOT rewrite the entire file) and re-validate.
 - If `"valid": true` — proceed to Step 4.
 
 ### Step 3.5: Run Distribution (if needed) — REQUIRES edits.json from Step 2
@@ -113,12 +115,24 @@ This creates the final edited DOCX. Do NOT use `--update-fields` if TOC was manu
 ### Step 6: Validate Output DOCX
 
 ```
-bash(command="python3 /skills/edit-docx/scripts/validate_docx.py /workspace/<output.docx> /workspace/docx_work")
+bash(command="python3 /skills/edit-docx/scripts/validation/validate_docx.py /workspace/<output.docx> /workspace/docx_work")
 ```
 
 Validates the output DOCX structure and content. Outputs JSON with errors/warnings.
 - If `"valid": false` — review errors, fix edits.json, re-run from Step 3.
 - If `"valid": true` with warnings only — review warnings, proceed if acceptable.
+
+### Step 7: Re-analyze & Verify
+
+```
+bash(command="python3 /skills/edit-docx/scripts/analyze_docx.py /workspace/<output.docx> /workspace/docx_work_verify")
+```
+
+Re-run analyze on the OUTPUT DOCX and review the text_merge:
+1. Check that all user-requested changes are reflected in the new text_merge
+2. Verify numbering is correct (no duplication, correct sequence)
+3. Verify TOC entries match the body headings (if TOC was edited)
+4. If discrepancies found — identify the cause, fix, and re-run from the appropriate step
 
 ---
 
@@ -186,9 +200,9 @@ Fields: `action`, `target_id`, `semantic_tag`, `edit_unit`, `new_text`, `table_s
 - **DELETE**: No style_alias needed
 
 ### Auto-Numbering (`|numPr`)
-- Styles marked with `|numPr` in text_merge have **automatic numbering** (Word generates numbers/bullets from `w:numPr`)
-- **DO NOT include number prefixes** (e.g., "1.", "1-1.", "1-5-1.", "-") in `new_text` for these styles — Word adds them automatically
-- Only include the actual content text (e.g., `"주요 구축 내용"` NOT `"1-5-1. 주요 구축 내용"`)
+- `|numPr:"1-5-1."` = Word auto-generates "1-5-1." before the text. The computed prefix is shown in quotes.
+- **DO NOT include number prefixes in `new_text`** — Word adds them automatically
+- Use the computed prefix when creating TOC entries for these blocks
 
 ### One Block = One Edit
 - NEVER combine multiple styled elements into one edit
@@ -342,10 +356,11 @@ Before writing edits.json, verify:
 8. TOC edits are NOT in edits.json (handle via direct XML — see Section D)
 
 Execution order (MUST follow):
-9. Write `edits.json` FIRST (Step 2)
-10. Run `validate_edits.py` (Step 3) — fix errors and re-validate until valid
-11. Run `generate_run_prompts.py` AFTER edits.json is finalized (Step 3.5) — process prompts if any
-12. Run `apply_edits.py` (Step 4)
-13. Edit TOC XML directly if needed (Section D)
-14. Run `repack_docx.py` (Step 5) — **without** `--update-fields` if TOC was manually edited
-15. Run `validate_docx.py` (Step 6) — verify output DOCX
+9. Write `edits.json` (Step 2)
+11. Run `validation/validate_edits.py` (Step 3) — fix errors and re-validate until valid
+12. Run `generate_run_prompts.py` AFTER edits.json is finalized (Step 3.5) — process prompts if any
+13. Run `apply_edits.py` (Step 4)
+14. Edit TOC XML directly if needed (Section D)
+15. Run `repack_docx.py` (Step 5) — **without** `--update-fields` if TOC was manually edited
+16. Run `validation/validate_docx.py` (Step 6) — verify output DOCX
+17. Re-analyze output DOCX (Step 7) — verify text_merge matches user request
