@@ -1258,11 +1258,18 @@ def generate_text_merge(parsed_result, state):
                 alias_counter += 1
             alias = style_key_to_alias[style_key]
 
+        # Detect auto-numbering from style_key (numPr in pPr)
+        has_numpr = (
+            block["type"] == "p"
+            and "numPr" in block.get("style_key", "")
+        )
+        numpr_flag = "|numPr" if has_numpr else ""
+
         # Build block marker with semantic tag and alias
         if block["semantic_tag"]:
-            block_marker = f"[{block['id']}:{block['semantic_tag']}|{alias}]"
+            block_marker = f"[{block['id']}:{block['semantic_tag']}|{alias}{numpr_flag}]"
         else:
-            block_marker = f"[{block['id']}|{alias}]"
+            block_marker = f"[{block['id']}|{alias}{numpr_flag}]"
 
         if block["type"] == "p":
             lines.append(f"{block_marker} {block['text']}")

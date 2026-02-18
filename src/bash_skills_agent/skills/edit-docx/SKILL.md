@@ -33,17 +33,21 @@ Read the text_merge output from Step 1. It shows document structure like:
 [b0:H1|S1] Chapter 1: Introduction
 [b1:BODY|S2] This is the first paragraph of body text.
 [b2:BODY|S2] Second paragraph with details.
-[b3:TBL|T1]
-  [b3:r0|RS0]
-    [b3:r0c0|CS0] [p0|S3] Header1
-    [b3:r0c1|CS1] [p0|S3] Header2
-  [b3:r1|RS1]
-    [b3:r1c0|CS0] [p0|S4] Data1
-    [b3:r1c1|CS1] [p0|S4] Data2
-[b4:TOC|toc_default]
-  [b4:p0] 1. Introduction 3
-  [b4:p1] 1-1. Background 4
+[b3:BODY|S5|numPr] Main requirements
+[b4:BODY|S6|numPr] - First bullet item
+[b5:TBL|T1]
+  [b5:r0|RS0]
+    [b5:r0c0|CS0] [p0|S3] Header1
+    [b5:r0c1|CS1] [p0|S3] Header2
+  [b5:r1|RS1]
+    [b5:r1c0|CS0] [p0|S4] Data1
+    [b5:r1c1|CS1] [p0|S4] Data2
+[b6:TOC|toc_default]
+  [b6:p0] 1. Introduction 3
+  [b6:p1] 1-1. Background 4
 ```
+
+- `|numPr` = style has auto-numbering (Word generates numbers/bullets automatically)
 
 Based on user's request, write an edit plan JSON to `/workspace/docx_work/edits.json`:
 
@@ -180,6 +184,11 @@ Fields: `action`, `target_id`, `semantic_tag`, `edit_unit`, `new_text`, `table_s
 - **REPLACE**: Use SAME style_alias as the original block
 - **INSERT**: Choose appropriate alias from text_merge (heading→S1, body→S2, etc.)
 - **DELETE**: No style_alias needed
+
+### Auto-Numbering (`|numPr`)
+- Styles marked with `|numPr` in text_merge have **automatic numbering** (Word generates numbers/bullets from `w:numPr`)
+- **DO NOT include number prefixes** (e.g., "1.", "1-1.", "1-5-1.", "-") in `new_text` for these styles — Word adds them automatically
+- Only include the actual content text (e.g., `"주요 구축 내용"` NOT `"1-5-1. 주요 구축 내용"`)
 
 ### One Block = One Edit
 - NEVER combine multiple styled elements into one edit
