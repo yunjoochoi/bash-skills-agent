@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""Phase 1: Standalone DOCX Analyzer for the editing pipeline.
+"""Phase 1: Standalone DOCX Analyzer — python3 analyze_docx.py <docx_path> <work_dir>
 
-Ported from docx_agent.tools.readers.docx_analyzer.DocxAnalyzer.
-
-Usage:
-    python3 analyze_docx.py <docx_path> <work_dir>
-
-Outputs:
-    - Prints text_merge to stdout
-    - Saves analysis.json to <work_dir>/analysis.json
-    - Extracts XML files to <work_dir>/extracted/
+Outputs text_merge to stdout and analysis.json to <work_dir>.
 """
 
 import copy
@@ -20,21 +12,15 @@ import sys
 import zipfile
 from xml.etree import ElementTree as ET
 
-# ============================================================================
-# Constants
-# ============================================================================
-
 NAMESPACES = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
 W_NS = NAMESPACES["w"]
 
-# Register namespaces for clean ElementTree output
 for _prefix, _uri in NAMESPACES.items():
     ET.register_namespace(_prefix, _uri)
 
-# Layout tags stripped from tcPr (handled by assembler post-processing)
 _TCPR_LAYOUT_TAGS = frozenset({
     f"{{{W_NS}}}tcW",
     f"{{{W_NS}}}gridSpan",
@@ -42,27 +28,11 @@ _TCPR_LAYOUT_TAGS = frozenset({
     f"{{{W_NS}}}hMerge",
 })
 
-# Boolean-only tags for style key generation
 _BOOLEAN_TAGS = {"b", "bCs", "i", "iCs", "strike", "dstrike", "caps", "smallCaps"}
 
-# rPr tags ignored for formatting variance detection.
-# These differ per script/language boundary (Korean↔English) and are
-# not intentional formatting differences.
-_IGNORED_RPR_TAGS = frozenset({
-    f"{{{W_NS}}}rFonts",
-    f"{{{W_NS}}}lang",
-})
-
-
-# ============================================================================
-# State namespace (replaces instance variables from the class)
-# ============================================================================
 
 class AnalyzerState:
-    """Mutable state for table deduplication caches.
-
-    Replaces DocxAnalyzer instance variables.
-    """
+    """Mutable state for table style deduplication caches."""
 
     __slots__ = (
         "table_style_templates",
@@ -76,34 +46,18 @@ class AnalyzerState:
     )
 
     def __init__(self):
-        # Table style management
-        self.table_style_templates = {}   # T1 -> template dict
+        self.table_style_templates = {}
         self._table_counter = 0
-
-        # RS/CS alias system for hierarchical table styles
-        self._row_style_cache = {}   # fingerprint -> RS alias
-        self._cell_style_cache = {}  # fingerprint -> CS alias
+        self._row_style_cache = {}
+        self._cell_style_cache = {}
         self._rs_counter = 0
         self._cs_counter = 0
+        self._row_style_map = {}
+        self._cell_style_map = {}
 
-        # Maps: alias -> template XML (populated during analysis)
-        self._row_style_map = {}   # RS0 -> tr_pr_xml
-        self._cell_style_map = {}  # CS0 -> tc_xml_template
-
-
-# ============================================================================
-# Text Extraction
-# ============================================================================
 
 def _extract_paragraph_text(p_element):
-    """Extract text content from paragraph element.
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        Concatenated text from all w:t elements
-    """
+    """Return concatenated text from all w:t elements in a paragraph."""
     texts = []
     for t in p_element.findall(".//w:t", NAMESPACES):
         if t.text:
@@ -112,17 +66,7 @@ def _extract_paragraph_text(p_element):
 
 
 def _extract_table_text(tbl_element):
-    """Extract text content from table element with cell and paragraph coords.
-
-    Format: Each row on a new line with cells separated by |
-    For cells with multiple paragraphs, each paragraph gets its own ID.
-
-    Args:
-        tbl_element: Table XML element
-
-    Returns:
-        Formatted table text string
-    """
+    """Extract table text with [rNcN] coordinates, rows separated by |."""
     rows = []
     for r_idx, tr in enumerate(tbl_element.findall(".//w:tr", NAMESPACES)):
         cells = []
@@ -130,14 +74,12 @@ def _extract_table_text(tbl_element):
             paragraphs = tc.findall("w:p", NAMESPACES)
 
             if len(paragraphs) <= 1:
-                # Simple cell: single paragraph, inline format
                 cell_text = ""
                 for t in tc.findall(".//w:t", NAMESPACES):
                     if t.text:
                         cell_text += t.text
                 cells.append(f"[r{r_idx}c{c_idx}] {cell_text}")
             else:
-                # Complex cell: multiple paragraphs, show each with pN ID
                 cell_lines = [f"[r{r_idx}c{c_idx}]"]
                 for p_idx, p in enumerate(paragraphs):
                     p_text = ""
@@ -154,18 +96,7 @@ def _extract_table_text(tbl_element):
 
 
 def _extract_sdt_text(sdt_element):
-    """Extract text content from structured document tag element.
-
-    For TOC and similar multi-paragraph SDT blocks, extracts each paragraph
-    with its index for partial editing support.
-
-    Args:
-        sdt_element: SDT XML element
-
-    Returns:
-        Formatted SDT text string
-    """
-    # Get SDT alias if available
+    """Extract text from SDT element, showing per-paragraph indices for multi-paragraph blocks."""
     alias = ""
     sdt_pr = sdt_element.find("w:sdtPr", NAMESPACES)
     if sdt_pr is not None:
@@ -173,10 +104,8 @@ def _extract_sdt_text(sdt_element):
         if alias_elem is not None:
             alias = alias_elem.get(f"{{{NAMESPACES['w']}}}val", "")
 
-    # Find SDT content
     sdt_content = sdt_element.find("w:sdtContent", NAMESPACES)
     if sdt_content is None:
-        # Fallback to direct text extraction
         texts = []
         for t in sdt_element.findall(".//w:t", NAMESPACES):
             if t.text:
@@ -186,11 +115,8 @@ def _extract_sdt_text(sdt_element):
             return f"[{alias}] {content_preview}"
         return f"[SDT] {content_preview}"
 
-    # Extract paragraphs from SDT content
     paragraphs = sdt_content.findall(".//w:p", NAMESPACES)
-
     if len(paragraphs) <= 1:
-        # Simple SDT: single paragraph, inline format
         texts = []
         for t in sdt_element.findall(".//w:t", NAMESPACES):
             if t.text:
@@ -200,7 +126,6 @@ def _extract_sdt_text(sdt_element):
             return f"[{alias}] {content}"
         return f"[SDT] {content}"
 
-    # Multi-paragraph SDT (like TOC): show each paragraph with pN index
     lines = [f"[{alias or 'SDT'}]"]
     for p_idx, p in enumerate(paragraphs):
         p_text = ""
@@ -214,37 +139,22 @@ def _extract_sdt_text(sdt_element):
 
 
 def _is_toc_sdt(sdt_element):
-    """Detect if SDT element is a Table of Contents.
-
-    Checks w:sdtPr for TOC indicators:
-    1. w:docPartGallery with "Table of Contents"
-    2. w:alias containing "TOC"
-    3. PAGEREF instrText in content
-
-    Args:
-        sdt_element: SDT XML element
-
-    Returns:
-        True if SDT is a TOC
-    """
+    """Detect if SDT is a TOC (docPartGallery / alias / PAGEREF)."""
     w_ns = NAMESPACES["w"]
     sdt_pr = sdt_element.find("w:sdtPr", NAMESPACES)
     if sdt_pr is not None:
-        # Check docPartGallery
         doc_part = sdt_pr.find(".//w:docPartGallery", NAMESPACES)
         if doc_part is not None:
             val = doc_part.get(f"{{{w_ns}}}val", "")
             if "Table of Contents" in val:
                 return True
 
-        # Check alias
         alias_elem = sdt_pr.find("w:alias", NAMESPACES)
         if alias_elem is not None:
             val = alias_elem.get(f"{{{w_ns}}}val", "")
             if "TOC" in val.upper():
                 return True
 
-    # Check for PAGEREF fields in content
     instr_texts = sdt_element.findall(".//w:instrText", NAMESPACES)
     for instr in instr_texts:
         if instr.text and "PAGEREF" in instr.text:
@@ -253,32 +163,9 @@ def _is_toc_sdt(sdt_element):
     return False
 
 
-# ============================================================================
-# Style Key System
-# ============================================================================
-
 def _element_to_key_part(elem):
-    """Convert XML element to deterministic key part string.
-
-    Handles various element patterns:
-    - Simple value: <w:jc w:val="center"/> -> "jc-center"
-    - Multi-attr: <w:spacing w:after="200" w:line="276"/>
-      -> "spacing-after200-line276"
-    - Nested: <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
-              -> "numPr-ilvl0-numId1"
-    - Boolean: <w:b/> -> "b"
-    - Boolean false: <w:b w:val="0"/> -> "" (skipped)
-
-    Args:
-        elem: XML element
-
-    Returns:
-        Key part string, or empty string if element should be skipped
-    """
-    # Strip namespace prefix for tag name
+    """Convert XML element to deterministic key part string (recursive)."""
     tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-
-    # Check for boolean false: <w:b w:val="0"/> or <w:i w:val="false"/>
     val_attr = elem.get(f"{{{W_NS}}}val")
     if (
         tag in _BOOLEAN_TAGS
@@ -288,40 +175,29 @@ def _element_to_key_part(elem):
     ):
         return ""
 
-    # Collect attribute values (sorted by local attr name)
     attr_parts = []
     for attr_name in sorted(elem.attrib.keys()):
         local_name = attr_name.split("}")[-1] if "}" in attr_name else attr_name
         attr_val = elem.attrib[attr_name]
-        # For simple w:val, use just the value
         if local_name == "val":
             attr_parts.append(attr_val)
         else:
             attr_parts.append(f"{local_name}{attr_val}")
 
-    # Handle nested children recursively
     child_parts = []
     for child in sorted(elem, key=lambda x: x.tag):
         child_part = _element_to_key_part(child)
         if child_part:
             child_parts.append(child_part)
 
-    # Build final part
     all_sub = attr_parts + child_parts
     if all_sub:
         return f"{tag}-{'_'.join(all_sub)}"
-    return tag  # Boolean element like <w:b/>
+    return tag
 
 
 def _extract_p_style(p_element):
-    """Extract w:pStyle value from paragraph element.
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        pStyle value or "Normal" if not present
-    """
+    """Return w:pStyle value or 'Normal'."""
     p_pr = p_element.find("w:pPr", NAMESPACES)
     if p_pr is not None:
         p_style_elem = p_pr.find("w:pStyle", NAMESPACES)
@@ -331,17 +207,7 @@ def _extract_p_style(p_element):
 
 
 def _build_ppr_key(p_element):
-    """Build deterministic key from ALL pPr children (excluding pStyle, rPr).
-
-    Sorts children by tag name for order independence.
-    Sorts attributes alphabetically within each element.
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        Underscore-joined key parts, or empty string if no relevant pPr children
-    """
+    """Build deterministic key from pPr children (excluding pStyle, rPr)."""
     p_pr = p_element.find("w:pPr", NAMESPACES)
     if p_pr is None:
         return ""
@@ -360,36 +226,14 @@ def _build_ppr_key(p_element):
 
 
 def _generate_style_key(p_element):
-    """Generate style key from pPr children only (no rPr).
-
-    Key format: {pStyle}_{ppr_key} or just {pStyle} if no pPr children.
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        Deterministic style key string
-    """
+    """Return '{pStyle}_{ppr_key}' style key (no rPr)."""
     p_style = _extract_p_style(p_element)
     ppr_key = _build_ppr_key(p_element)
     return f"{p_style}_{ppr_key}" if ppr_key else p_style
 
 
-# ============================================================================
-# Template Building
-# ============================================================================
-
 def _build_rpr_key(run):
-    """Build deterministic key from ALL rPr children.
-
-    Sorts by tag name for order independence.
-
-    Args:
-        run: Run XML element (<w:r>)
-
-    Returns:
-        Underscore-joined key parts, or "default" if no rPr
-    """
+    """Build deterministic key from rPr children, or 'default' if none."""
     r_pr = run.find("w:rPr", NAMESPACES)
     if r_pr is None:
         return "default"
@@ -404,14 +248,7 @@ def _build_rpr_key(run):
 
 
 def _run_has_text(run):
-    """Check if a run element contains actual text content.
-
-    Args:
-        run: Run XML element (<w:r>)
-
-    Returns:
-        True if at least one <w:t> has non-empty text
-    """
+    """True if run has at least one non-empty w:t."""
     for t in run.findall("w:t", NAMESPACES):
         if t.text and t.text.strip():
             return True
@@ -419,14 +256,7 @@ def _run_has_text(run):
 
 
 def _describe_run_styles(run):
-    """Generate human-readable description of run styles for LLM prompt.
-
-    Args:
-        run: Run XML element (<w:r>)
-
-    Returns:
-        Description string like "bold, size:28, font:Arial"
-    """
+    """Human-readable run style description (e.g. 'bold, size:28')."""
     r_pr = run.find("w:rPr", NAMESPACES)
     if r_pr is None:
         return "default"
@@ -481,17 +311,7 @@ def _describe_run_styles(run):
 
 
 def _build_run_style_template(run):
-    """Create run style template dict from a <w:r> element.
-
-    Deep copies the run, replaces <w:t> text with {{content}}.
-    Preserves ALL rPr children (rFonts, sz, b, etc.) in the XML template.
-
-    Args:
-        run: Run XML element (<w:r>)
-
-    Returns:
-        Dict with rpr_key, rpr_xml, display_description
-    """
+    """Deep-copy run, replace w:t with {{content}}, return template dict."""
     rpr_key = _build_rpr_key(run)
     template_run = copy.deepcopy(run)
     for t in template_run.findall("w:t", NAMESPACES):
@@ -508,35 +328,15 @@ def _build_run_style_template(run):
 
 
 def _build_ppr_xml(p_element):
-    """Extract <w:pPr>...</w:pPr> XML (no filtering, preserves all children).
-
-    Includes <w:rPr> inside <w:pPr> (paragraph mark default run properties).
-
-    Args:
-        p_element: Paragraph XML element
-
-    Returns:
-        Serialized <w:pPr> XML string, or empty string if no pPr
-    """
+    """Return serialized w:pPr XML string, or '' if no pPr."""
     p_pr = p_element.find("w:pPr", NAMESPACES)
     if p_pr is None:
         return ""
     return ET.tostring(p_pr, encoding="unicode")
 
 
-# ============================================================================
-# Table Hierarchy
-# ============================================================================
-
 def _extract_table_xml_template(tbl_element):
-    """Extract table shell XML: tblPr + tblGrid only (no rows).
-
-    Args:
-        tbl_element: Table XML element
-
-    Returns:
-        Table shell XML string without w:tr elements
-    """
+    """Return table shell XML (tblPr + tblGrid, no rows)."""
     template = copy.deepcopy(tbl_element)
     for tr in template.findall("w:tr", NAMESPACES):
         template.remove(tr)
@@ -544,41 +344,19 @@ def _extract_table_xml_template(tbl_element):
 
 
 def _extract_row_xml_template(tr_element):
-    """Extract row properties as template dict.
-
-    Args:
-        tr_element: Table row XML element
-
-    Returns:
-        Dict with tr_pr_xml_template
-    """
+    """Return dict with tr_pr_xml_template from row element."""
     tr_pr = tr_element.find("w:trPr", NAMESPACES)
     tr_pr_xml = ET.tostring(tr_pr, encoding="unicode") if tr_pr is not None else ""
     return {"tr_pr_xml_template": tr_pr_xml}
 
 
 def _extract_cell_xml_template(tc_element):
-    """Extract cell XML shell: tcPr (visual only) + {{content}}.
-
-    Matroshka pattern: keeps only visual tcPr properties (shading,
-    borders, vAlign), strips layout properties (tcW, gridSpan, vMerge)
-    that are handled by assembler post-processing.
-    The {{content}} placeholder is filled at assembly time with
-    paragraph XML built from the linked ParagraphStyleTemplate.
-
-    Args:
-        tc_element: Table cell XML element
-
-    Returns:
-        Cell XML shell string
-    """
+    """Return cell XML shell: visual tcPr + {{content}} (layout tags stripped)."""
     template = copy.deepcopy(tc_element)
 
-    # Remove all paragraphs - content is injected at assembly time
     for p in template.findall("w:p", NAMESPACES):
         template.remove(p)
 
-    # Strip layout properties from tcPr
     tc_pr = template.find("w:tcPr", NAMESPACES)
     if tc_pr is not None:
         for child in list(tc_pr):
@@ -592,17 +370,7 @@ def _extract_cell_xml_template(tc_element):
 
 
 def _extract_cell_style(tc_element):
-    """Extract cell style with paragraph hierarchy.
-
-    For each paragraph in the cell, builds a paragraph style template
-    dict with pPr XML and unique run style templates.
-
-    Args:
-        tc_element: Table cell XML element
-
-    Returns:
-        Dict with paragraph_styles and tc_xml_template
-    """
+    """Extract cell style: paragraph_styles + tc_xml_template."""
     tc_xml_template = _extract_cell_xml_template(tc_element)
     paragraph_styles = []
 
@@ -633,23 +401,7 @@ def _extract_cell_style(tc_element):
 
 
 def _extract_table_hierarchy(tbl_element, state):
-    """Extract hierarchical table style with T1:R0:C0 format.
-
-    Creates a table style template dict with:
-    - Table-level: tblPr + tblGrid shell XML
-    - Row-level: trPr XML template
-    - Cell-level: paragraph_styles + tc_xml_template
-
-    Deduplicates row/cell styles - identical styles share same alias.
-
-    Args:
-        tbl_element: Table XML element
-        state: 
-    AnalyzerState instance
-
-    Returns:
-        Tuple of (table_template_dict, row_style_aliases, cell_style_map)
-    """
+    """Extract hierarchical table style (T:RS:CS) with deduplication."""
     state._table_counter += 1
     table_key = f"T{state._table_counter}"
     tbl_xml_template = _extract_table_xml_template(tbl_element)
@@ -660,7 +412,6 @@ def _extract_table_hierarchy(tbl_element, state):
     cell_style_map = {}
 
     for r_idx, tr in enumerate(tbl_element.findall("w:tr", NAMESPACES)):
-        # Extract row style and assign RS alias via fingerprint
         row_tmpl = _extract_row_xml_template(tr)
         fp = row_tmpl["tr_pr_xml_template"]
 
@@ -673,7 +424,6 @@ def _extract_table_hierarchy(tbl_element, state):
         row_style_aliases.append(state._row_style_cache[fp])
         row_styles[r_idx] = row_tmpl
 
-        # Extract cell styles per row
         row_cells = []
         for c_idx, tc in enumerate(tr.findall("w:tc", NAMESPACES)):
             cell_tmpl = _extract_cell_style(tc)
@@ -700,52 +450,9 @@ def _extract_table_hierarchy(tbl_element, state):
     return table_template, row_style_aliases, cell_style_map
 
 
-def _get_toc_entry_text(block, para_idx):
-    """Extract text from a specific TOC paragraph by index.
-
-    Args:
-        block: Block dict with 'xml' key containing SDT XML
-        para_idx: 0-indexed paragraph in sdtContent
-
-    Returns:
-        Entry text (e.g., "1. Introduction | 3")
-    """
-    try:
-        root = ET.fromstring(block["xml"])
-        sdt_content = root.find("w:sdtContent", NAMESPACES)
-        if sdt_content is None:
-            return ""
-
-        paragraphs = sdt_content.findall(".//w:p", NAMESPACES)
-        if para_idx >= len(paragraphs):
-            return ""
-
-        p = paragraphs[para_idx]
-        texts = []
-        for t in p.findall(".//w:t", NAMESPACES):
-            if t.text:
-                texts.append(t.text)
-        return " ".join(texts)
-    except ET.ParseError:
-        return ""
-
-
-# ============================================================================
-# Semantic Tag Inference
-# ============================================================================
 
 def _build_style_lookup(extracted_path):
-    """Parse styles.xml and build a lookup dict for semantic inference.
-
-    Args:
-        extracted_path: Path to extracted XMLs directory
-
-    Returns:
-        Dict mapping styleId to style info dict with keys:
-        - name: Style name
-        - outline_lvl: Outline level (int or None)
-        - based_on: basedOn styleId or None
-    """
+    """Parse styles.xml → {styleId: {name, outline_lvl, based_on}}."""
     styles_xml_path = os.path.join(extracted_path, "word", "styles.xml")
     if not os.path.exists(styles_xml_path):
         return {}
@@ -788,26 +495,12 @@ def _build_style_lookup(extracted_path):
 
 
 def _infer_semantic_info(block, styles_xml_path):
-    """Determine semantic tag (H1, BODY, LIST, etc.) for a paragraph block.
-
-    Priority:
-    1. Paragraph XML outlineLvl (highest priority)
-    2. styles.xml outlineLvl
-    3. Style name keywords (fallback)
-
-    Args:
-        block: Block dict with 'xml' and 'style_key'
-        styles_xml_path: Path to extracted XMLs directory (for styles.xml lookup)
-
-    Returns:
-        Semantic tag string (H1, H2, ..., BODY, LIST, TITLE, SUBTITLE, OTHER)
-    """
+    """Infer semantic tag (H1..H9, BODY, LIST, TITLE, SUBTITLE, TOC)."""
     try:
         p_element = ET.fromstring(block["xml"])
     except ET.ParseError:
         return "BODY"
 
-    # 1. Check paragraph-level outlineLvl first
     outline_elem = p_element.find(".//w:outlineLvl", NAMESPACES)
     if outline_elem is not None:
         try:
@@ -816,17 +509,13 @@ def _infer_semantic_info(block, styles_xml_path):
         except ValueError:
             pass
 
-    # Extract style ID from paragraph
     style_id = _extract_p_style(p_element)
-
-    # 2. Check styles.xml lookup
     style_lookup = _build_style_lookup(styles_xml_path)
     if style_id in style_lookup:
         info = style_lookup[style_id]
         if info.get("outline_lvl") is not None:
             return f"H{info['outline_lvl'] + 1}"
 
-    # 3. Fallback to name-based inference
     name_lower = style_id.lower()
     name_from_lookup = ""
     if style_id in style_lookup:
@@ -837,7 +526,6 @@ def _infer_semantic_info(block, styles_xml_path):
         if not name:
             continue
         if "heading" in name:
-            # Try to extract heading level from name
             for i in range(1, 10):
                 if str(i) in name:
                     return f"H{i}"
@@ -854,22 +542,8 @@ def _infer_semantic_info(block, styles_xml_path):
     return "BODY"
 
 
-# ============================================================================
-# Numbering Computation
-# ============================================================================
-
 def _parse_numbering_xml(extracted_path):
-    """Parse numbering.xml and build numbering definitions.
-
-    Reads abstractNum definitions (level formats) and num instances
-    (numId -> abstractNumId mapping with optional start overrides).
-
-    Args:
-        extracted_path: Path to extracted XMLs directory
-
-    Returns:
-        Dict with abstract_nums and num_map, or None if file missing
-    """
+    """Parse numbering.xml → {abstract_nums, num_map}, or None."""
     numbering_path = os.path.join(extracted_path, "word", "numbering.xml")
     if not os.path.exists(numbering_path):
         return None
@@ -948,16 +622,7 @@ def _parse_numbering_xml(extracted_path):
 
 
 def _format_number(value, num_fmt):
-    """Format a counter value according to Word numFmt.
-
-    Args:
-        value: Integer counter value
-        num_fmt: Format string (decimal, lowerLetter, upperLetter,
-                 lowerRoman, upperRoman, bullet, etc.)
-
-    Returns:
-        Formatted string
-    """
+    """Format counter value per Word numFmt (decimal, lowerLetter, lowerRoman, etc.)."""
     if num_fmt == "decimal":
         return str(value)
     if num_fmt == "lowerLetter":
@@ -983,28 +648,13 @@ def _format_number(value, num_fmt):
 
 
 def _compute_effective_numbering(blocks, numbering_defs):
-    """Compute effective numbering prefix for each block with numPr.
-
-    Walks blocks in document order, maintaining counters per numId.
-    When ilvl goes to same or shallower level, deeper level counters reset.
-
-    Args:
-        blocks: List of block dicts (document order)
-        numbering_defs: Output from _parse_numbering_xml()
-
-    Returns:
-        Dict mapping block_id to computed number prefix string
-    """
+    """Compute numbering prefix per block → {block_id: prefix_string}."""
     if numbering_defs is None:
         return {}
 
     abstract_nums = numbering_defs["abstract_nums"]
     num_map = numbering_defs["num_map"]
 
-    # Per-numId state:
-    #   counters: {ilvl: counter_value} — init to start-1, incremented on use
-    #   used: {ilvl: bool} — tracks which levels were directly used
-    #   last_ilvl: last ilvl used
     counters = {}
     used = {}
     last_ilvl = {}
@@ -1018,7 +668,6 @@ def _compute_effective_numbering(blocks, numbering_defs):
         if "numPr" not in style_key:
             continue
 
-        # Extract numId and ilvl from paragraph XML
         try:
             p_elem = ET.fromstring(block["xml"])
         except ET.ParseError:
@@ -1040,11 +689,9 @@ def _compute_effective_numbering(blocks, numbering_defs):
         ilvl = int(ilvl_elem.get(f"{{{W_NS}}}val", "0"))
         num_id = numid_elem.get(f"{{{W_NS}}}val", "0")
 
-        # Skip numId=0 (means no numbering)
         if num_id == "0":
             continue
 
-        # Resolve abstractNumId
         if num_id not in num_map:
             continue
         abstract_num_id = num_map[num_id]["abstractNumId"]
@@ -1054,7 +701,6 @@ def _compute_effective_numbering(blocks, numbering_defs):
         levels = abstract_nums[abstract_num_id]
         overrides = num_map[num_id].get("overrides", {})
 
-        # Initialize counters for this numId on first use
         if num_id not in counters:
             counters[num_id] = {}
             used[num_id] = {}
@@ -1064,7 +710,6 @@ def _compute_effective_numbering(blocks, numbering_defs):
                 used[num_id][lvl_idx] = False
             last_ilvl[num_id] = -1
 
-        # Reset deeper levels when at same or shallower level
         prev_ilvl = last_ilvl.get(num_id, -1)
         if ilvl <= prev_ilvl:
             for reset_lvl in range(ilvl + 1, 9):
@@ -1073,14 +718,12 @@ def _compute_effective_numbering(blocks, numbering_defs):
                     counters[num_id][reset_lvl] = start - 1
                     used[num_id][reset_lvl] = False
 
-        # Increment current level counter and mark as used
         if ilvl not in counters[num_id]:
             counters[num_id][ilvl] = 0
         counters[num_id][ilvl] += 1
         used[num_id][ilvl] = True
         last_ilvl[num_id] = ilvl
 
-        # Get level definition
         if ilvl not in levels:
             continue
 
@@ -1089,12 +732,8 @@ def _compute_effective_numbering(blocks, numbering_defs):
         lvl_text = lvl_def["lvlText"]
 
         if num_fmt == "bullet":
-            # Bullet: use lvlText character directly
             result[block["id"]] = lvl_text if lvl_text else ""
         else:
-            # Numbered: substitute %1, %2, etc. with counter values
-            # For levels never directly used, show their start value
-            # (Word renders parent level counters even if unused)
             prefix = lvl_text
             for ref_lvl in range(9):
                 placeholder = f"%{ref_lvl + 1}"
@@ -1102,7 +741,6 @@ def _compute_effective_numbering(blocks, numbering_defs):
                     if used[num_id].get(ref_lvl, False):
                         counter_val = counters[num_id].get(ref_lvl, 0)
                     else:
-                        # Parent level never used: show start value
                         ref_start = overrides.get(
                             ref_lvl,
                             levels.get(ref_lvl, {}).get("start", 1),
@@ -1116,30 +754,11 @@ def _compute_effective_numbering(blocks, numbering_defs):
     return result
 
 
-# ============================================================================
-# Core Pipeline
-# ============================================================================
-
 def extract_docx_xml(docx_path, output_dir):
-    """Extract XML files from DOCX archive.
-
-    Extracts all .xml and .rels files while preserving directory structure.
-
-    Args:
-        docx_path: Path to the DOCX file
-        output_dir: Directory to extract XMLs to
-
-    Returns:
-        Path to the extracted directory
-
-    Raises:
-        FileNotFoundError: If DOCX file does not exist
-        zipfile.BadZipFile: If file is not a valid DOCX/ZIP
-    """
+    """Extract .xml and .rels files from DOCX to output_dir."""
     if not os.path.exists(docx_path):
         raise FileNotFoundError(f"DOCX file not found: {docx_path}")
 
-    # Clean output directory if exists
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -1156,23 +775,7 @@ def extract_docx_xml(docx_path, output_dir):
 
 
 def parse_document_blocks(extracted_path, state):
-    """Parse document.xml into content blocks.
-
-    Extracts paragraphs (w:p), tables (w:tbl), and SDTs (w:sdt)
-    as content blocks with unique IDs. Section properties (w:sectPr)
-    are skipped as they are immutable layout anchors.
-
-    Args:
-        extracted_path: Path to extracted XMLs directory
-        state: 
-    AnalyzerState instance
-
-    Returns:
-        List of block dicts
-
-    Raises:
-        FileNotFoundError: If document.xml not found
-    """
+    """Parse document.xml into content blocks (p, tbl, sdt)."""
     document_xml_path = os.path.join(extracted_path, "word", "document.xml")
     if not os.path.exists(document_xml_path):
         raise FileNotFoundError(f"document.xml not found: {document_xml_path}")
@@ -1211,7 +814,6 @@ def parse_document_blocks(extracted_path, state):
             text = _extract_table_text(child)
             xml_str = ET.tostring(child, encoding="unicode")
 
-            # Extract hierarchical table styles
             table_tmpl, row_aliases, cell_alias_map = (
                 _extract_table_hierarchy(child, state)
             )
@@ -1230,7 +832,7 @@ def parse_document_blocks(extracted_path, state):
             block_id += 1
 
         elif tag == "sectPr":
-            continue  # Section properties are immutable; skip
+            continue
 
         elif tag == "sdt":
             is_toc = _is_toc_sdt(child)
@@ -1252,7 +854,6 @@ def parse_document_blocks(extracted_path, state):
             })
             block_id += 1
 
-    # Infer semantic tags for paragraph blocks
     for block in blocks:
         if block["type"] == "p":
             block["semantic_tag"] = _infer_semantic_info(block, extracted_path)
@@ -1261,18 +862,7 @@ def parse_document_blocks(extracted_path, state):
 
 
 def build_paragraph_style_templates(parsed_result):
-    """Build paragraph style template dictionary from parsed blocks.
-
-    Creates deduplicated paragraph style templates with pPr XML and
-    run style templates for each unique paragraph style_key.
-    Table blocks are handled separately via table_style_templates.
-
-    Args:
-        parsed_result: List of parsed block dicts
-
-    Returns:
-        Dictionary mapping style_key to paragraph style template dict
-    """
+    """Build deduplicated paragraph style templates from parsed blocks."""
     templates = {}
 
     for block in parsed_result:
@@ -1290,7 +880,6 @@ def build_paragraph_style_templates(parsed_result):
                     "run_style_templates": {},
                 }
 
-            # Collect unique run patterns from every block with this key
             template = templates[block["style_key"]]
             existing_rpr_keys = {
                 r["rpr_key"]
@@ -1314,32 +903,10 @@ def build_paragraph_style_templates(parsed_result):
 def _generate_hierarchical_table_text(
     block, style_key_to_alias, style_alias_map, alias_counter, state
 ):
-    """Generate hierarchical table text aligned with target_id format.
-
-    Output format matches edit target_id coordinates directly:
-
-        [b13:r0|RS0]
-          [b13:r0c0|CS2] [p0|S1] Header1
-          [b13:r0c1|CS3] [p0|S2] Header2
-        [b13:r1|RS1]
-          [b13:r1c0|CS2] [p0|S1] Data1
-          [b13:r1c1|CS3] [p0|S2] Data2
-
-    Args:
-        block: Block dict with row_style_aliases and cell_style_map
-        style_key_to_alias: Existing style_key -> alias mapping
-        style_alias_map: Existing alias -> style_key mapping
-        alias_counter: Current alias counter
-        state: 
-    AnalyzerState instance
-
-    Returns:
-        Dict with 'lines' and 'next_alias_counter'
-    """
+    """Generate hierarchical table text with [bN:rNcN|CS] [pN|S] format."""
     if block["row_style_aliases"] is None:
         return {"lines": [], "next_alias_counter": alias_counter}
 
-    # Add RS/CS mappings to style_alias_map
     for rs_alias, tr_pr_xml in state._row_style_map.items():
         if rs_alias not in style_alias_map:
             style_alias_map[rs_alias] = tr_pr_xml
@@ -1359,7 +926,6 @@ def _generate_hierarchical_table_text(
             else f"RS{r_idx}"
         )
 
-        # Row line: [b13:r0|RS0]
         lines.append(f"  [{block_id}:r{r_idx}|{rs_alias}]")
 
         cells = tr.findall("w:tc", NAMESPACES)
@@ -1373,7 +939,6 @@ def _generate_hierarchical_table_text(
 
             paragraphs = tc.findall("w:p", NAMESPACES)
 
-            # Cell header: [b13:r0c0|CS2] (CS alias at cell level)
             cell_header = f"[{block_id}:r{r_idx}c{c_idx}|{cs_alias}]"
             first_para_in_cell = True
 
@@ -1384,7 +949,6 @@ def _generate_hierarchical_table_text(
                 if not p_text.strip():
                     continue
 
-                # All paragraphs (including p0) get S alias
                 p_style_key = _generate_style_key(p)
                 if p_style_key not in style_key_to_alias:
                     p_alias = f"S{alias_counter}"
@@ -1393,7 +957,6 @@ def _generate_hierarchical_table_text(
                     alias_counter += 1
                 p_alias = style_key_to_alias[p_style_key]
 
-                # Format: [b13:r0c0|CS2] [p0|S1] text
                 if first_para_in_cell:
                     lines.append(
                         f"    {cell_header} [p{p_idx}|{p_alias}] {p_text}"
@@ -1410,108 +973,18 @@ def _generate_hierarchical_table_text(
     }
 
 
-def _extract_table_text_with_styles(
-    table_xml, style_key_to_alias, style_alias_map, alias_counter
-):
-    """Extract table text with per-cell-paragraph style aliases (legacy fallback).
-
-    Args:
-        table_xml: Table XML string
-        style_key_to_alias: Existing style_key -> alias mapping
-        style_alias_map: Existing alias -> style_key mapping
-        alias_counter: Current alias counter
-
-    Returns:
-        Dict with 'lines' (list of formatted lines) and 'next_alias_counter'
-    """
-    tbl_element = ET.fromstring(table_xml)
-    rows = []
-
-    for r_idx, tr in enumerate(tbl_element.findall(".//w:tr", NAMESPACES)):
-        cells = []
-        for c_idx, tc in enumerate(tr.findall(".//w:tc", NAMESPACES)):
-            paragraphs = tc.findall("w:p", NAMESPACES)
-
-            if len(paragraphs) <= 1:
-                # Simple cell: single paragraph
-                p = paragraphs[0] if paragraphs else None
-                cell_text = ""
-                for t in tc.findall(".//w:t", NAMESPACES):
-                    if t.text:
-                        cell_text += t.text
-
-                if p is not None:
-                    p_style_key = _generate_style_key(p)
-                    if p_style_key not in style_key_to_alias:
-                        alias = f"S{alias_counter}"
-                        style_key_to_alias[p_style_key] = alias
-                        style_alias_map[alias] = p_style_key
-                        alias_counter += 1
-                    p_alias = style_key_to_alias[p_style_key]
-                    cells.append(f"[r{r_idx}c{c_idx}|{p_alias}] {cell_text}")
-                else:
-                    cells.append(f"[r{r_idx}c{c_idx}] {cell_text}")
-            else:
-                # Complex cell: multiple paragraphs
-                cell_lines = [f"[r{r_idx}c{c_idx}]"]
-                for p_idx, p in enumerate(paragraphs):
-                    p_text = ""
-                    for t in p.findall(".//w:t", NAMESPACES):
-                        if t.text:
-                            p_text += t.text
-
-                    if p_text.strip():
-                        p_style_key = _generate_style_key(p)
-                        if p_style_key not in style_key_to_alias:
-                            alias = f"S{alias_counter}"
-                            style_key_to_alias[p_style_key] = alias
-                            style_alias_map[alias] = p_style_key
-                            alias_counter += 1
-                        p_alias = style_key_to_alias[p_style_key]
-                        cell_lines.append(
-                            f"    [r{r_idx}c{c_idx}p{p_idx}|{p_alias}] {p_text}"
-                        )
-                cells.append("\n".join(cell_lines))
-        rows.append(" | ".join(cells))
-
-    return {
-        "lines": rows,
-        "next_alias_counter": alias_counter,
-    }
-
 
 def generate_text_merge(parsed_result, state, num_prefix_map=None):
-    """Generate text merge string for LLM input with style aliases.
-
-    Creates a text representation with block IDs and style aliases.
-    Uses short aliases (S1, S2) to save tokens, with mapping stored separately.
-
-    Format: [bN:TAG|S1] text content
-    For auto-numbered blocks: [bN:TAG|S1|numPr:"1-5-1."] text content
-
-    Args:
-        parsed_result: List of parsed block dicts
-        state: 
-    AnalyzerState instance
-        num_prefix_map: Optional dict mapping block_id to computed number prefix
-
-    Returns:
-        Tuple of (text_merge, style_alias_map)
-        - text_merge: Concatenated text with block markers
-        - style_alias_map: {"S1": "Heading1_jc-...", "S2": "Normal_jc-..."}
-    """
+    """Generate text_merge string with block markers and style aliases."""
     lines = []
     style_alias_map = {}
     style_key_to_alias = {}
     alias_counter = 1
 
     for block in parsed_result:
-        # Skip blocks with empty or whitespace-only text
         if not block["text"] or not block["text"].strip():
             continue
 
-        # Get or create alias for this style_key
-        # TABLE blocks use style_key directly as alias (T1, T2...)
         if block["type"] == "tbl":
             alias = block["style_key"]
             if alias not in style_alias_map:
@@ -1526,7 +999,6 @@ def generate_text_merge(parsed_result, state, num_prefix_map=None):
                 alias_counter += 1
             alias = style_key_to_alias[style_key]
 
-        # Detect auto-numbering from style_key (numPr in pPr)
         has_numpr = (
             block["type"] == "p"
             and "numPr" in block.get("style_key", "")
@@ -1539,7 +1011,6 @@ def generate_text_merge(parsed_result, state, num_prefix_map=None):
         else:
             numpr_flag = ""
 
-        # Build block marker with semantic tag and alias
         if block["semantic_tag"]:
             block_marker = f"[{block['id']}:{block['semantic_tag']}|{alias}{numpr_flag}]"
         else:
@@ -1549,27 +1020,15 @@ def generate_text_merge(parsed_result, state, num_prefix_map=None):
             lines.append(f"{block_marker} {block['text']}")
         elif block["type"] == "tbl":
             lines.append(block_marker)
-            # Use hierarchical format with inline table metadata
-            if block["row_style_aliases"] is not None:
-                table_lines = _generate_hierarchical_table_text(
-                    block, style_key_to_alias, style_alias_map, alias_counter,
-                    state,
-                )
-                alias_counter = table_lines["next_alias_counter"]
-                for row_line in table_lines["lines"]:
-                    lines.append(row_line)
-            else:
-                # Fallback to legacy format
-                table_lines = _extract_table_text_with_styles(
-                    block["xml"], style_key_to_alias, style_alias_map,
-                    alias_counter,
-                )
-                alias_counter = table_lines["next_alias_counter"]
-                for row_line in table_lines["lines"]:
-                    lines.append(f"  {row_line}")
+            table_lines = _generate_hierarchical_table_text(
+                block, style_key_to_alias, style_alias_map, alias_counter,
+                state,
+            )
+            alias_counter = table_lines["next_alias_counter"]
+            for row_line in table_lines["lines"]:
+                lines.append(row_line)
         elif block["type"] == "sdt":
             if block["semantic_tag"] == "TOC":
-                # Show individual TOC entries with paragraph IDs
                 lines.append(block_marker)
                 try:
                     root = ET.fromstring(block["xml"])
@@ -1596,48 +1055,23 @@ def generate_text_merge(parsed_result, state, num_prefix_map=None):
 
 
 def analyze(docx_path, work_dir):
-    """Run complete Phase 1 analysis on a DOCX file.
-
-    Combines extraction, parsing, template building, and text merge generation.
-
-    Args:
-        docx_path: Path to the DOCX file
-        work_dir: Working directory for output files
-
-    Returns:
-        Dict containing all analysis results
-    """
+    """Run complete analysis: extract → parse → templates → text_merge."""
     state = AnalyzerState()
     extracted_path = os.path.join(work_dir, "extracted")
 
-    # Step 1: Extract XML from DOCX
     extract_docx_xml(docx_path, extracted_path)
-
-    # Step 2: Parse document blocks
     parsed_result = parse_document_blocks(extracted_path, state)
-
-    # Step 3: Build paragraph style templates
     paragraph_templates = build_paragraph_style_templates(parsed_result)
-
-    # Step 3.5: Compute effective numbering from numbering.xml
     numbering_defs = _parse_numbering_xml(extracted_path)
     num_prefix_map = _compute_effective_numbering(parsed_result, numbering_defs)
-
-    # Step 4: Generate text merge
     text_merge, style_alias_map = generate_text_merge(
         parsed_result, state, num_prefix_map
     )
 
-    # Build output dict (all plain dicts, no Pydantic)
     serializable_blocks = list(parsed_result)
-
-    # Convert table_style_templates row_styles/cell_style_templates keys
     serializable_table_templates = {}
     for tkey, tval in state.table_style_templates.items():
-        t = dict(tval)
-        # row_styles and cell_style_templates already have str keys from
-        # _extract_table_hierarchy
-        serializable_table_templates[tkey] = t
+        serializable_table_templates[tkey] = dict(tval)
 
     output = {
         "text_merge": text_merge,
@@ -1671,12 +1105,10 @@ def main():
 
     result = analyze(docx_path, work_dir)
 
-    # Save analysis.json
     analysis_path = os.path.join(work_dir, "analysis.json")
     with open(analysis_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    # Print text_merge to stdout
     print(result["text_merge"])
 
 

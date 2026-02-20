@@ -94,6 +94,7 @@ Run both: structural validation + re-analysis. Check the verification text_merge
 - **DELETE**: Target block absent
 - **Numbering**: If numPr heading inserted/deleted, compare before/after prefixes for ALL subsequent headings
 - **TOC**: Each entry text + bookmark must match corresponding body heading with correct numPr values
+- **Intent check**: Re-read the user's original request and compare against the verification text_merge. Confirm every requested change is reflected and no unintended modifications were made.
 
 If corrections needed → use OUTPUT as new input, repeat from Step 1.
 
@@ -252,6 +253,7 @@ Fields: `action`, `target_id`, `semantic_tag`, `edit_unit`, `new_text`, `table_s
 - Row `cell_style_aliases`: **nested** list `[["CS0", "CS1"]]`
 - Column `cell_style_aliases`: **flat** list `["CS0", "CS0", "CS0"]`
 - Row cell count (pipe-separated in `new_text`) must match table column count
+- **Structural edits that change preconditions → separate passes**: If one edit changes the structure another edit depends on (e.g., column INSERT changes column count that row INSERT relies on), split into separate edit plans with re-analysis between them.
 
 ---
 
@@ -297,7 +299,7 @@ Use `lxml` for TOC XML manipulation (preserves namespace prefixes, handles OOXML
 1. Parse extracted `document.xml` with `lxml.etree`
 2. Find the TOC `<w:sdt>` block and target heading's bookmark
 3. Edit operations:
-   - **Add entry**: Copy existing TOC paragraph, change anchor + text + PAGEREF
+   - **Add entry**: Deep-copy an existing `<w:p>` from `<w:sdtContent>` at the same heading level, then update: (a) hyperlink `w:anchor` value, (b) display text in `<w:t>` including numPr prefix, (c) PAGEREF bookmark name in `<w:instrText>`. Do NOT build from scratch — always clone an existing entry to preserve tab stops, fonts, and field code structure.
    - **Modify entry**: Update `<w:t>` text and `<w:hyperlink>` anchor + PAGEREF
    - **Delete entry**: Remove `<w:p>` from `<w:sdtContent>`
    - **Add bookmark**: Insert `<w:bookmarkStart>` / `<w:bookmarkEnd>` around body heading
@@ -309,7 +311,7 @@ Use `lxml` for TOC XML manipulation (preserves namespace prefixes, handles OOXML
 - Bookmark IDs must be unique across the document
 - **Do NOT use `--update-fields`** when TOC was manually edited
 - Page numbers in manually added entries are static placeholders
-- **Number prefixes in TOC entries MUST match re-analyzed numPr values** — never use pre-edit numbering
+- **TOC entry text MUST include the numPr prefix** from re-analysis. Read the `numPr:"..."` value from the heading's text_merge marker and prepend it to the heading text in the TOC entry.
 
 ---
 

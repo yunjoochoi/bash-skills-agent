@@ -1,44 +1,21 @@
 #!/usr/bin/env python3
-"""Apply edits to an extracted DOCX document.xml.
-
-Combined port of:
-  - docx_mapper.py  (simplified mapping -- no LLM calls)
-  - docx_assembler.py (core XML assembly)
-
-Usage:
-    python3 apply_edits.py <work_dir>
-
-Reads:
-    <work_dir>/analysis.json   -- output from analyze_docx.py
-    <work_dir>/edits.json      -- edit instructions
-
-Modifies:
-    <work_dir>/extracted/word/document.xml   -- in-place
-
-Python stdlib only: xml.etree.ElementTree, json, os, re, sys, copy, secrets
-"""
+"""Apply edits to an extracted DOCX document.xml."""
 
 import copy
 import json
 import os
 import re
-import secrets
 import sys
 from xml.etree import ElementTree as ET
 
-# ---------------------------------------------------------------------------
-# OOXML namespaces
-# ---------------------------------------------------------------------------
 NAMESPACES = {
     "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
 
-# Register prefixes so ET output uses w: / r: instead of ns0: / ns1:
 for _pfx, _uri in NAMESPACES.items():
     ET.register_namespace(_pfx, _uri)
 
-# Indicators that a paragraph contains non-text content (images, drawings)
 _NON_TEXT_INDICATORS = (
     "AlternateContent",
     "<w:drawing",
@@ -49,10 +26,6 @@ _NON_TEXT_INDICATORS = (
     "<v:group",
 )
 
-
-# ===================================================================
-# Phase A  --  Simplified Mapper (no LLM calls)
-# ===================================================================
 
 def escape_xml(text):
     """Escape XML reserved characters."""
@@ -66,7 +39,7 @@ def escape_xml(text):
 
 
 def _ensure_t_space_preserve(run_xml):
-    """Ensure <w:t> elements have xml:space='preserve' for proper whitespace."""
+    """Ensure <w:t> elements have xml:space='preserve'."""
     import re
     def _add_attr(m):
         tag = m.group(0)
@@ -77,34 +50,14 @@ def _ensure_t_space_preserve(run_xml):
 
 
 def _resolve_style_key(style_alias, style_alias_map, fallback=""):
-    """Resolve a style alias (S1, S2...) to a style_key via the alias map.
-
-    Args:
-        style_alias: Short alias like 'S1'.
-        style_alias_map: Mapping alias -> style_key.
-        fallback: Value to return when alias cannot be resolved.
-
-    Returns:
-        Resolved style_key string.
-    """
+    """Resolve a style alias (S1, S2...) to a style_key via the alias map."""
     if not style_alias:
         return fallback
     return style_alias_map.get(style_alias, fallback)
 
 
 def _build_run_xml_from_template(new_text, run_style_templates):
-    """Build a single <w:r> XML using the first run style template.
-
-    Fallback when no explicit ``runs`` spec is provided: all text goes
-    into one run using the first available RST.
-
-    Args:
-        new_text: Plain text to insert.
-        run_style_templates: Dict of RS alias -> {rpr_key, rpr_xml, ...}.
-
-    Returns:
-        List containing one assembled <w:r> XML string, or empty list.
-    """
+    """Build a single <w:r> XML using the first run style template."""
     if not run_style_templates:
         return []
     first_rst = next(iter(run_style_templates.values()))
@@ -116,19 +69,7 @@ def _build_run_xml_from_template(new_text, run_style_templates):
 
 
 def _build_run_xmls_from_spec(runs_spec, run_style_templates):
-    """Build <w:r> XML strings from an explicit runs specification.
-
-    Each entry in *runs_spec* maps a text fragment to a run style alias.
-    This enables the LLM to distribute text across multiple formatting
-    styles within one paragraph (e.g. normal + bold).
-
-    Args:
-        runs_spec: List of ``{"text": "...", "run_style": "RS0"}`` dicts.
-        run_style_templates: Dict of RS alias -> {rpr_key, rpr_xml, ...}.
-
-    Returns:
-        List of assembled <w:r> XML strings.
-    """
+    """Build <w:r> XML strings from an explicit runs specification."""
     if not run_style_templates:
         return []
     first_rst = next(iter(run_style_templates.values()))
@@ -146,22 +87,11 @@ def _build_run_xmls_from_spec(runs_spec, run_style_templates):
 
 
 def generate_new_blocks(edits, analysis):
-    """Generate new_block dicts from edits + analysis (Phase A).
-
-    Replaces the async LLM-driven DocxMapper.generate_mapping_result().
-
-    Args:
-        edits: List of edit dicts from edits.json.
-        analysis: Full analysis.json dict.
-
-    Returns:
-        List of new_block dicts ready for Phase B.
-    """
+    """Generate new_block dicts from edits + analysis (Phase A)."""
     style_alias_map = analysis.get("style_alias_map", {})
     paragraph_style_templates = analysis.get("paragraph_style_templates", {})
     blocks = analysis.get("blocks", [])
 
-    # Build id -> block lookup
     id_to_block = {b["id"]: b for b in blocks}
 
     new_blocks = []
@@ -176,7 +106,6 @@ def generate_new_blocks(edits, analysis):
 
         base_id = target_id.split(":")[0]
 
-        # ----- DELETE -----
         if action == "delete":
             nb = {
                 "action": "delete",
@@ -191,9 +120,7 @@ def generate_new_blocks(edits, analysis):
             new_blocks.append(nb)
             continue
 
-        # ----- INSERT_AFTER / INSERT_BEFORE -----
         if action in ("insert_after", "insert_before"):
-            # Table inserts: pass through RS/CS aliases
             if semantic_tag == "TBL" or edit_unit:
                 style_key = ""
                 tbl_alias = edit.get("table_style_alias") or style_alias
@@ -214,7 +141,6 @@ def generate_new_blocks(edits, analysis):
                 new_blocks.append(nb)
                 continue
 
-            # Paragraph insert: resolve style_alias -> style_key
             style_key = _resolve_style_key(
                 style_alias, style_alias_map,
             )
@@ -224,7 +150,6 @@ def generate_new_blocks(edits, analysis):
 
             run_xmls = []
             runs_spec = edit.get("runs")
-            # Prefer edit-level RST map (from generate_run_prompts), fall back to PST
             edit_rst = edit.get("run_style_templates")
             if not edit_rst:
                 pst = paragraph_style_templates.get(style_key, {})
@@ -248,9 +173,7 @@ def generate_new_blocks(edits, analysis):
             new_blocks.append(nb)
             continue
 
-        # ----- REPLACE -----
         if action == "replace":
-            # Table replace: pass through as-is
             if semantic_tag == "TBL" or edit_unit:
                 style_key = ""
                 if style_alias:
@@ -270,7 +193,6 @@ def generate_new_blocks(edits, analysis):
                 new_blocks.append(nb)
                 continue
 
-            # Regular paragraph replace
             block = id_to_block.get(base_id)
             style_key = ""
             if style_alias:
@@ -280,15 +202,10 @@ def generate_new_blocks(edits, analysis):
             if not style_key and block:
                 style_key = block.get("style_key", "")
 
-            # For paragraphs with images/drawings, we will use
-            # in-place text replacement in the assembler
-            # (detected via _has_non_text_content).
-            # For normal paragraphs, build run XML from first RST.
             run_xmls = []
             if block and new_text:
                 xml_str = block.get("xml", "")
                 if not _has_non_text_content(xml_str):
-                    # Prefer edit-level RST map (from generate_run_prompts)
                     edit_rst = edit.get("run_style_templates")
                     if not edit_rst:
                         pst = paragraph_style_templates.get(style_key, {})
@@ -319,23 +236,8 @@ def generate_new_blocks(edits, analysis):
     return new_blocks
 
 
-# ===================================================================
-# Phase B  --  Assembly  (ported from DocxAssembler)
-# ===================================================================
-
-# -------------------------------------------------------------------
-# Utility helpers
-# -------------------------------------------------------------------
-
 def _has_non_text_content(xml_str):
-    """Detect images/drawings in paragraph XML.
-
-    Args:
-        xml_str: Paragraph XML string.
-
-    Returns:
-        True if non-text content indicators are found.
-    """
+    """Detect images/drawings in paragraph XML."""
     for indicator in _NON_TEXT_INDICATORS:
         if indicator in xml_str:
             return True
@@ -343,14 +245,7 @@ def _has_non_text_content(xml_str):
 
 
 def _extract_bookmarks_xml(xml_str):
-    """Extract bookmarkStart/End XML strings from a paragraph.
-
-    Args:
-        xml_str: Paragraph XML string.
-
-    Returns:
-        Tuple of (starts_list, ends_list) where each is a list of XML strings.
-    """
+    """Extract bookmarkStart/End XML strings from a paragraph."""
     try:
         root = ET.fromstring(xml_str)
     except ET.ParseError:
@@ -364,37 +259,23 @@ def _extract_bookmarks_xml(xml_str):
 
 
 def _inject_bookmarks_into_para(para_xml, bk_starts, bk_ends):
-    """Inject bookmark elements into a paragraph XML string.
-
-    Inserts bookmarkStart after pPr and bookmarkEnd at end of paragraph.
-
-    Args:
-        para_xml: Paragraph XML string.
-        bk_starts: List of bookmarkStart XML strings.
-        bk_ends: List of bookmarkEnd XML strings.
-
-    Returns:
-        Modified paragraph XML string.
-    """
+    """Inject bookmark elements into a paragraph XML string."""
     if not bk_starts and not bk_ends:
         return para_xml
     try:
         root = ET.fromstring(para_xml)
         ns_w = NAMESPACES["w"]
 
-        # Find insert position (after pPr)
         ppr = root.find(f"{{{ns_w}}}pPr")
         children = list(root)
         insert_idx = (children.index(ppr) + 1) if ppr is not None else 0
 
-        # Insert bookmarkStart elements (reverse to maintain order)
         for bk_xml_str in reversed(bk_starts):
             try:
                 root.insert(insert_idx, ET.fromstring(bk_xml_str))
             except ET.ParseError:
                 pass
 
-        # Append bookmarkEnd elements at the end
         for bk_xml_str in bk_ends:
             try:
                 root.append(ET.fromstring(bk_xml_str))
@@ -407,37 +288,14 @@ def _inject_bookmarks_into_para(para_xml, bk_starts, bk_ends):
 
 
 def _normalize_newlines(text):
-    """Normalize literal backslash-n to actual newlines.
-
-    Handles cases where JSON double-escaping produces literal \\n
-    instead of actual newline characters.
-
-    Args:
-        text: Input string.
-
-    Returns:
-        String with literal \\n replaced by actual newlines (if no real
-        newlines were present).
-    """
+    """Normalize literal backslash-n to actual newlines."""
     if "\n" not in text and "\\n" in text:
         return text.replace("\\n", "\n")
     return text
 
 
 def _replace_text_preserving_structure(original_xml, new_text):
-    """In-place text replacement preserving paragraph structure.
-
-    Parses the paragraph XML, finds all w:t elements inside w:r elements,
-    sets new text on the first w:t, and clears the rest.
-    Does NOT call escape_xml (ET handles escaping internally).
-
-    Args:
-        original_xml: Original paragraph XML string.
-        new_text: New plain text to set.
-
-    Returns:
-        Modified paragraph XML string.
-    """
+    """In-place text replacement preserving paragraph structure."""
     try:
         root = ET.fromstring(original_xml)
     except ET.ParseError:
@@ -459,27 +317,8 @@ def _replace_text_preserving_structure(original_xml, new_text):
     return ET.tostring(root, encoding="unicode")
 
 
-# -------------------------------------------------------------------
-# apply_mapping_to_blocks
-# -------------------------------------------------------------------
-
 def apply_mapping_to_blocks(blocks, new_blocks):
-    """Mark blocks with internal flags from new_blocks.
-
-    Converts blocks to dicts (if not already) and attaches
-    _replaced, _deleted, _replacements, _inserts_after,
-    _inserts_before, _row_deletions, _col_deletions,
-    _col_inserts_after, _col_inserts_before,
-    _sdt_entry_deletions, _sdt_entry_inserts, etc.
-
-    Args:
-        blocks: List of block dicts from analysis.json.
-        new_blocks: List of new_block dicts from Phase A.
-
-    Returns:
-        List of block dicts with edit markers applied.
-    """
-    # Ensure we work on copies
+    """Mark blocks with internal edit flags from new_blocks."""
     blocks = [dict(b) for b in blocks]
     id_to_idx = {b["id"]: i for i, b in enumerate(blocks)}
 
@@ -494,7 +333,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
         is_table = block_type == "tbl"
         is_sdt = block_type == "sdt"
 
-        # Parse sub-coordinate from target_id (after block ID)
         sub_coord = (
             nb["target_id"][len(target_id) + 1:]
             if ":" in nb["target_id"]
@@ -503,7 +341,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
 
         action = nb["action"]
 
-        # ----- REPLACE -----
         if action == "replace":
             blocks[idx]["_replaced"] = True
             if "_replacements" not in blocks[idx]:
@@ -518,9 +355,7 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 "cell_style_aliases": nb.get("cell_style_aliases"),
             })
 
-        # ----- DELETE -----
         elif action == "delete":
-            # SDT entry deletion (b5:p3 pattern)
             sdt_para_match = re.match(r"p(\d+)$", sub_coord)
             if is_sdt and sdt_para_match:
                 p_idx = int(sdt_para_match.group(1))
@@ -531,7 +366,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 blocks[idx].setdefault("_replacements", [])
                 continue
 
-            # Table sub-element deletion
             row_match = re.match(r"r(\d+)$", sub_coord)
             col_match = re.match(r"c(\d+)$", sub_coord)
 
@@ -550,7 +384,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 blocks[idx]["_replaced"] = True
                 blocks[idx].setdefault("_replacements", [])
             else:
-                # Cell paragraph deletion
                 cell_para_del = re.match(r"r(\d+)c(\d+)p(\d+)$", sub_coord)
                 if is_table and cell_para_del:
                     blocks[idx].setdefault("_para_deletions", []).append({
@@ -563,9 +396,7 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 else:
                     blocks[idx]["_deleted"] = True
 
-        # ----- INSERT_AFTER -----
         elif action == "insert_after":
-            # SDT entry insert
             sdt_para_match = re.match(r"p(\d+)$", sub_coord)
             if is_sdt and sdt_para_match:
                 p_idx = int(sdt_para_match.group(1))
@@ -582,7 +413,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 blocks[idx].setdefault("_replacements", [])
                 continue
 
-            # Column insert_after (b13:c0 pattern)
             col_match_ia = re.match(r"c(\d+)$", sub_coord)
             eu_ia = nb.get("edit_unit")
             is_col_insert_ia = (
@@ -594,7 +424,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
             if is_col_insert_ia and col_match_ia:
                 c_idx = int(col_match_ia.group(1))
                 cs_aliases = nb.get("cell_style_aliases") or []
-                # Flatten [[CS0],[CS1]] -> [CS0,CS1] if nested
                 if cs_aliases and isinstance(cs_aliases[0], list):
                     cs_aliases = [row[0] for row in cs_aliases if row]
                 blocks[idx].setdefault("_col_inserts_after", []).append({
@@ -622,9 +451,7 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                     "cell_style_aliases": nb.get("cell_style_aliases"),
                 })
 
-        # ----- INSERT_BEFORE -----
         elif action == "insert_before":
-            # SDT entry insert_before
             sdt_para_match = re.match(r"p(\d+)$", sub_coord)
             if is_sdt and sdt_para_match:
                 p_idx = int(sdt_para_match.group(1))
@@ -641,7 +468,6 @@ def apply_mapping_to_blocks(blocks, new_blocks):
                 blocks[idx].setdefault("_replacements", [])
                 continue
 
-            # Column insert_before (b13:c0 pattern)
             col_match_ib = re.match(r"c(\d+)$", sub_coord)
             eu_ib = nb.get("edit_unit")
             is_col_insert_ib = (
@@ -683,35 +509,14 @@ def apply_mapping_to_blocks(blocks, new_blocks):
     return blocks
 
 
-# -------------------------------------------------------------------
-# Block XML building
-# -------------------------------------------------------------------
-
 def _build_block_xml(block_spec, paragraph_style_templates, table_style_templates,
                      style_alias_map):
-    """Generate XML for a new/replacement block.
-
-    Priority:
-      1. table style pool -> _build_table_from_template
-      2. run_xmls: pre-assembled <w:r> XML strings
-      3. first RST from paragraph_style_templates
-      4. bare paragraph fallback
-
-    Args:
-        block_spec: Dict with style_key, content, run_xmls, etc.
-        paragraph_style_templates: Style key -> PST dict.
-        table_style_templates: Table style key -> TST dict.
-        style_alias_map: Full alias map.
-
-    Returns:
-        Generated XML string or None.
-    """
+    """Generate XML for a new/replacement block."""
     ns = NAMESPACES["w"]
     style_key = block_spec.get("style_key", "")
     content = block_spec.get("content", "")
     run_xmls = block_spec.get("run_xmls", [])
 
-    # Priority 1: Table style pool
     if style_key in table_style_templates:
         return _build_table_from_template(
             table_style_templates[style_key],
@@ -723,7 +528,6 @@ def _build_block_xml(block_spec, paragraph_style_templates, table_style_template
             style_alias_map=style_alias_map,
         )
 
-    # Get paragraph template
     if style_key not in paragraph_style_templates:
         if paragraph_style_templates:
             style_key = next(iter(paragraph_style_templates))
@@ -732,7 +536,6 @@ def _build_block_xml(block_spec, paragraph_style_templates, table_style_template
 
     template = paragraph_style_templates[style_key]
 
-    # Priority 2: Pre-assembled run XMLs
     if run_xmls:
         ppr = template.get("ppr_xml_template") or f'<w:pPr xmlns:w="{ns}"/>'
         return (
@@ -740,7 +543,6 @@ def _build_block_xml(block_spec, paragraph_style_templates, table_style_template
             f'{ppr}{"".join(run_xmls)}</w:p>'
         )
 
-    # Priority 3: First RST
     rst_dict = template.get("run_style_templates", {})
     if rst_dict:
         first_rst = next(iter(rst_dict.values()))
@@ -751,7 +553,6 @@ def _build_block_xml(block_spec, paragraph_style_templates, table_style_template
         ppr = template.get("ppr_xml_template") or f'<w:pPr xmlns:w="{ns}"/>'
         return f'<w:p xmlns:w="{ns}">{ppr}{run_xml}</w:p>'
 
-    # Priority 4: Bare paragraph fallback
     escaped = escape_xml(content)
     ppr = template.get("ppr_xml_template") or f'<w:pPr xmlns:w="{ns}"/>'
     return (
@@ -761,16 +562,7 @@ def _build_block_xml(block_spec, paragraph_style_templates, table_style_template
 
 
 def _append_paragraphs_from_content(body_parts, template, content, ns):
-    """Append one or more paragraphs from template + plain content.
-
-    Handles newline splitting: each line becomes a separate paragraph.
-
-    Args:
-        body_parts: Accumulator list for XML strings.
-        template: PST dict with ppr_xml_template and run_style_templates.
-        content: Plain text (may contain newlines).
-        ns: OOXML namespace URI.
-    """
+    """Append one or more paragraphs from template + plain content."""
     rst_dict = template.get("run_style_templates", {})
     ppr = template.get("ppr_xml_template") or f'<w:pPr xmlns:w="{ns}"/>'
 
@@ -798,70 +590,10 @@ def _append_paragraphs_from_content(body_parts, template, content, ns):
         body_parts.append(_build_para(content))
 
 
-def _build_paragraph_element(text, style_key, paragraph_style_templates):
-    """Build a <w:p> Element from a ParagraphStyleTemplate dict.
-
-    Args:
-        text: Plain text content.
-        style_key: Style key for PST lookup.
-        paragraph_style_templates: PST dict pool.
-
-    Returns:
-        ET.Element for <w:p>.
-    """
-    ns = NAMESPACES["w"]
-    tpl = paragraph_style_templates.get(style_key) if style_key else None
-
-    if tpl:
-        ppr = tpl.get("ppr_xml_template") or f'<w:pPr xmlns:w="{ns}"/>'
-        rst_dict = tpl.get("run_style_templates", {})
-        escaped = escape_xml(text)
-        if rst_dict:
-            first_rst = next(iter(rst_dict.values()))
-            run_xml = _ensure_t_space_preserve(
-                first_rst.get("rpr_xml", "").replace(
-                    "{{content}}", escaped,
-                )
-            )
-        else:
-            run_xml = (
-                f'<w:r xmlns:w="{ns}">'
-                f'<w:t xml:space="preserve">{escaped}</w:t></w:r>'
-            )
-        para_xml = f'<w:p xmlns:w="{ns}">{ppr}{run_xml}</w:p>'
-    else:
-        escaped = escape_xml(text)
-        para_xml = (
-            f'<w:p xmlns:w="{ns}"><w:r>'
-            f'<w:t xml:space="preserve">{escaped}</w:t>'
-            f"</w:r></w:p>"
-        )
-
-    return ET.fromstring(para_xml)
-
-
-# -------------------------------------------------------------------
-# Table operations
-# -------------------------------------------------------------------
-
 def _table_replace_paragraph(table_xml, r_idx, c_idx, p_idx, new_text,
                              run_xmls=None, style_key="",
                              paragraph_style_templates=None):
-    """Replace text in a specific paragraph within a table cell.
-
-    Args:
-        table_xml: Original table XML string.
-        r_idx: Row index (0-based).
-        c_idx: Column index (0-based).
-        p_idx: Paragraph index within cell (0-based).
-        new_text: New text content.
-        run_xmls: Pre-assembled <w:r> XML strings.
-        style_key: Style key (unused in current path).
-        paragraph_style_templates: PST dict pool (unused in current path).
-
-    Returns:
-        Modified table XML string.
-    """
+    """Replace text in a specific paragraph within a table cell."""
     try:
         root = ET.fromstring(table_xml)
         xml_rows = root.findall(".//w:tr", NAMESPACES)
@@ -880,7 +612,6 @@ def _table_replace_paragraph(table_xml, r_idx, c_idx, p_idx, new_text,
         target_para = paragraphs[p_idx]
 
         if run_xmls:
-            # Replace runs with pre-assembled XMLs
             existing_runs = target_para.findall("w:r", NAMESPACES)
             for run in existing_runs:
                 target_para.remove(run)
@@ -891,7 +622,6 @@ def _table_replace_paragraph(table_xml, r_idx, c_idx, p_idx, new_text,
                 except ET.ParseError:
                     pass
         else:
-            # Simple text replacement
             para_runs = target_para.findall("w:r", NAMESPACES)
 
             if "\n" in new_text:
@@ -913,7 +643,6 @@ def _table_replace_paragraph(table_xml, r_idx, c_idx, p_idx, new_text,
                         else:
                             t.text = ""
 
-                # Clone paragraph for remaining lines
                 insert_ref = target_para
                 for extra_line in lines[1:]:
                     new_para = _clone_paragraph_with_text(
@@ -952,15 +681,7 @@ def _table_replace_paragraph(table_xml, r_idx, c_idx, p_idx, new_text,
 
 
 def _clone_paragraph_with_text(source_para, escaped_text):
-    """Clone a paragraph, keep first run style, replace text.
-
-    Args:
-        source_para: Source paragraph element.
-        escaped_text: XML-escaped text for the cloned paragraph.
-
-    Returns:
-        New paragraph Element.
-    """
+    """Clone a paragraph, keep first run style, replace text."""
     new_para = copy.deepcopy(source_para)
     ns_w = NAMESPACES["w"]
     runs = new_para.findall(f"{{{ns_w}}}r")
@@ -997,24 +718,7 @@ def _table_add_row(table_xml, after_r_idx, row_contents,
                    paragraph_style_templates=None,
                    table_style_templates=None,
                    table_style_key="", style_alias_map=None):
-    """Add a new row to a table after the specified row.
-
-    Builds the row from scratch using RS/CS templates.
-
-    Args:
-        table_xml: Original table XML string.
-        after_r_idx: Insert new row after this row index (0-based).
-        row_contents: Cell text contents (one per cell).
-        row_style_alias: RS alias for trPr.
-        cell_style_aliases: CS alias per cell.
-        paragraph_style_templates: PST dict pool.
-        table_style_templates: TST dict pool.
-        table_style_key: Table style key.
-        style_alias_map: Full alias map.
-
-    Returns:
-        Modified table XML string.
-    """
+    """Add a new row to a table after the specified row."""
     cell_style_aliases = cell_style_aliases or []
     paragraph_style_templates = paragraph_style_templates or {}
     table_style_templates = table_style_templates or {}
@@ -1036,16 +740,13 @@ def _table_add_row(table_xml, after_r_idx, row_contents,
             target_row.findall("w:tc", NAMESPACES),
         )
 
-        # Get column widths
         tbl_grid = root.find("w:tblGrid", NAMESPACES)
         total_width = _get_table_total_width(root)
         col_widths = _extract_column_widths(tbl_grid, num_cols, total_width)
 
-        # Create new row
         new_row = ET.Element(f"{{{ns_w}}}tr")
         _apply_row_style(new_row, row_style_alias, style_alias_map)
 
-        # Look up cell paragraph styles from TST
         tst = table_style_templates.get(table_style_key, {})
         tst_cells = []
         if tst:
@@ -1083,14 +784,12 @@ def _table_add_row(table_xml, after_r_idx, row_contents,
             )
             new_row.append(new_cell)
 
-        # Insert after target row
         parent = root
         for child_idx, child in enumerate(list(parent)):
             if child is target_row:
                 parent.insert(child_idx + 1, new_row)
                 break
         else:
-            # Search nested
             for tbl in root.iter():
                 children = list(tbl)
                 for child_idx, child in enumerate(children):
@@ -1105,15 +804,7 @@ def _table_add_row(table_xml, after_r_idx, row_contents,
 
 
 def _table_delete_row(table_xml, r_idx):
-    """Delete a specific row from a table.
-
-    Args:
-        table_xml: Original table XML string.
-        r_idx: Row index to delete (0-based).
-
-    Returns:
-        Modified table XML.
-    """
+    """Delete a specific row from a table."""
     try:
         root = ET.fromstring(table_xml)
         xml_rows = root.findall(".//w:tr", NAMESPACES)
@@ -1133,15 +824,7 @@ def _table_delete_row(table_xml, r_idx):
 
 
 def _table_delete_column(table_xml, c_idx):
-    """Delete a specific column from a table.
-
-    Args:
-        table_xml: Original table XML string.
-        c_idx: Column index to delete (0-based).
-
-    Returns:
-        Modified table XML.
-    """
+    """Delete a specific column from a table."""
     try:
         root = ET.fromstring(table_xml)
         tbl_grid = root.find("w:tblGrid", NAMESPACES)
@@ -1157,13 +840,11 @@ def _table_delete_column(table_xml, c_idx):
         if len(first_row_cells) <= 1:
             return table_xml
 
-        # Remove cell from each row
         for tr in xml_rows:
             cells = tr.findall("w:tc", NAMESPACES)
             if c_idx < len(cells):
                 tr.remove(cells[c_idx])
 
-        # Remove gridCol
         if tbl_grid is not None:
             grid_cols = tbl_grid.findall("w:gridCol", NAMESPACES)
             if c_idx < len(grid_cols):
@@ -1176,19 +857,7 @@ def _table_delete_column(table_xml, c_idx):
 
 
 def _table_delete_paragraph(table_xml, row_idx, col_idx, para_idx):
-    """Delete a specific paragraph from a table cell.
-
-    OOXML requires at least one paragraph per cell.
-
-    Args:
-        table_xml: Original table XML string.
-        row_idx: Row index (0-based).
-        col_idx: Column index (0-based).
-        para_idx: Paragraph index (0-based).
-
-    Returns:
-        Modified table XML.
-    """
+    """Delete a specific paragraph from a table cell."""
     try:
         root = ET.fromstring(table_xml)
         xml_rows = root.findall(".//w:tr", NAMESPACES)
@@ -1217,23 +886,7 @@ def _table_delete_paragraph(table_xml, row_idx, col_idx, para_idx):
 def _table_add_column(table_xml, after_col_idx, col_contents,
                       cell_style_aliases, paragraph_style_templates,
                       style_alias_map, tst=None):
-    """Add a new column to a table after the specified column.
-
-    Uses CS aliases to build each cell via _build_cell_from_alias,
-    then restores layout tags (tcW) from the adjacent cell for width.
-
-    Args:
-        table_xml: Original table XML string.
-        after_col_idx: Insert new column after this index (0-based).
-                       Use -1 to insert at the beginning.
-        col_contents: Cell contents for the new column (one per row).
-        cell_style_aliases: CS alias for each row's new cell.
-        paragraph_style_templates: PST dict pool.
-        style_alias_map: Full alias map.
-
-    Returns:
-        Modified table XML with new column inserted.
-    """
+    """Add a new column to a table after the specified column."""
     try:
         root = ET.fromstring(table_xml)
         tbl_grid = root.find("w:tblGrid", NAMESPACES)
@@ -1255,7 +908,6 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
             tbl_grid, current_col_count, total_width,
         )
 
-        # Estimate new column width from max text length
         min_col_w = 400
         new_col_max_chars = max(
             (_estimate_text_width(c) for c in col_contents),
@@ -1265,7 +917,6 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
         new_col_width = max(new_col_width, min_col_w)
         new_col_width = min(new_col_width, total_width * 3 // 10)
 
-        # Shrink existing columns proportionally
         original_total = sum(original_gc_widths) or total_width
         remaining = total_width - new_col_width
         if remaining < min_col_w * current_col_count:
@@ -1284,7 +935,6 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
         all_widths = list(adjusted_widths)
         all_widths.insert(insert_pos, new_col_width)
 
-        # Update tblGrid
         ns_w = NAMESPACES["w"]
         if tbl_grid is not None:
             new_grid_col = ET.Element(f"{{{ns_w}}}gridCol")
@@ -1297,7 +947,6 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
                 if i < len(all_widths):
                     gc.set(f"{{{ns_w}}}w", str(all_widths[i]))
 
-        # Add new cell to each row
         cst = tst.get("cell_style_templates", {}) if tst else {}
         for r_idx, tr in enumerate(xml_rows):
             cs_alias = (
@@ -1308,7 +957,6 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
             cell_content = (
                 col_contents[r_idx] if r_idx < len(col_contents) else ""
             )
-            # Look up cell paragraph styles (font info) from TST
             cell_ps = None
             if cst:
                 tc_xml_ref = style_alias_map.get(cs_alias, "")
@@ -1346,20 +994,7 @@ def _table_add_column(table_xml, after_col_idx, col_contents,
 
 def _table_insert_column_paragraph(table_xml, col_idx, col_contents,
                                    style_key, paragraph_style_templates):
-    """Insert a new paragraph into each cell of a specific column.
-
-    Appends a paragraph at the end of each cell at col_idx.
-
-    Args:
-        table_xml: Original table XML string.
-        col_idx: Target column index (0-based).
-        col_contents: Paragraph text per row (one per row).
-        style_key: Style key for paragraph generation.
-        paragraph_style_templates: PST dict pool.
-
-    Returns:
-        Modified table XML with paragraphs inserted.
-    """
+    """Insert a new paragraph into each cell of a specific column."""
     try:
         root = ET.fromstring(table_xml)
         xml_rows = root.findall(".//w:tr", NAMESPACES)
@@ -1379,7 +1014,6 @@ def _table_insert_column_paragraph(table_xml, col_idx, col_contents,
             )
             if not cell_text:
                 continue
-            # Build paragraph from template
             template = paragraph_style_templates.get(style_key)
             if template:
                 ppr = template.get("ppr_xml_template", "")
@@ -1415,19 +1049,8 @@ def _table_insert_column_paragraph(table_xml, col_idx, col_contents,
         return table_xml
 
 
-# -------------------------------------------------------------------
-# Table cell building helpers
-# -------------------------------------------------------------------
-
 def _get_table_total_width(root):
-    """Extract total table width from tblPr/tblW.
-
-    Args:
-        root: Table root element.
-
-    Returns:
-        Total width in twips (default 9000).
-    """
+    """Extract total table width from tblPr/tblW."""
     tbl_pr = root.find("w:tblPr", NAMESPACES)
     if tbl_pr is not None:
         tbl_w = tbl_pr.find("w:tblW", NAMESPACES)
@@ -1439,16 +1062,7 @@ def _get_table_total_width(root):
 
 
 def _extract_column_widths(tbl_grid, num_cols, total_width):
-    """Extract per-column widths from tblGrid.
-
-    Args:
-        tbl_grid: tblGrid element (may be None).
-        num_cols: Expected number of columns.
-        total_width: Total table width.
-
-    Returns:
-        List of column widths in twips.
-    """
+    """Extract per-column widths from tblGrid."""
     ns_w = NAMESPACES["w"]
     grid_cols = (
         tbl_grid.findall("w:gridCol", NAMESPACES)
@@ -1470,25 +1084,16 @@ def _extract_column_widths(tbl_grid, num_cols, total_width):
 
 
 def _estimate_text_width(text):
-    """Estimate visual text width in half-width character units.
-
-    CJK / Hangul / fullwidth characters count as 2, others as 1.
-
-    Args:
-        text: Input string.
-
-    Returns:
-        Estimated width (minimum 1).
-    """
+    """Estimate visual text width in half-width character units."""
     width = 0
     for ch in text:
         cp = ord(ch)
         if (
-            0x1100 <= cp <= 0x11FF      # Hangul Jamo
-            or 0x3000 <= cp <= 0x9FFF   # CJK + punctuation
-            or 0xAC00 <= cp <= 0xD7AF   # Hangul Syllables
-            or 0xF900 <= cp <= 0xFAFF   # CJK Compatibility
-            or 0xFF01 <= cp <= 0xFF60   # Fullwidth Forms
+            0x1100 <= cp <= 0x11FF
+            or 0x3000 <= cp <= 0x9FFF
+            or 0xAC00 <= cp <= 0xD7AF
+            or 0xF900 <= cp <= 0xFAFF
+            or 0xFF01 <= cp <= 0xFF60
         ):
             width += 2
         else:
@@ -1497,12 +1102,7 @@ def _estimate_text_width(text):
 
 
 def _update_all_cell_widths(root, col_widths):
-    """Update tcW in all table cells to match col_widths.
-
-    Args:
-        root: Table root element.
-        col_widths: Width per column index.
-    """
+    """Update tcW in all table cells to match col_widths."""
     ns_w = NAMESPACES["w"]
     for tr in root.findall("w:tr", NAMESPACES):
         for c_i, tc in enumerate(tr.findall("w:tc", NAMESPACES)):
@@ -1519,13 +1119,7 @@ def _update_all_cell_widths(root, col_widths):
 
 
 def _apply_row_style(row, row_style_alias, style_alias_map):
-    """Apply RS alias trPr to a row element.
-
-    Args:
-        row: Row element to modify in-place.
-        row_style_alias: RS alias (e.g., 'RS0').
-        style_alias_map: Full alias map.
-    """
+    """Apply RS alias trPr to a row element."""
     ns_w = NAMESPACES["w"]
     tr_pr_xml = style_alias_map.get(row_style_alias, "")
 
@@ -1535,7 +1129,6 @@ def _apply_row_style(row, row_style_alias, style_alias_map):
             row.remove(old_trpr)
         try:
             new_trpr = ET.fromstring(tr_pr_xml)
-            # Strip tblHeader from new rows
             hdr = new_trpr.find(f"{{{ns_w}}}tblHeader")
             if hdr is not None:
                 new_trpr.remove(hdr)
@@ -1547,28 +1140,12 @@ def _apply_row_style(row, row_style_alias, style_alias_map):
 def _build_cell_from_alias(cs_alias, text, col_width,
                            paragraph_style_templates, style_alias_map,
                            cell_para_styles=None):
-    """Build a complete <w:tc> element from CS alias.
-
-    CS aliases map to tc_xml_template strings with {{content}} placeholders.
-
-    Args:
-        cs_alias: Cell style alias (e.g., 'CS0').
-        text: Cell text content.
-        col_width: Cell width in twips.
-        paragraph_style_templates: PST dict pool.
-        style_alias_map: Full alias map.
-        cell_para_styles: Optional paragraph_styles list from TST
-            cell_style_templates (contains pPr + RSTs with font info).
-
-    Returns:
-        Complete <w:tc> Element.
-    """
+    """Build a complete <w:tc> element from CS alias."""
     ns_w = NAMESPACES["w"]
     tc_xml = style_alias_map.get(cs_alias, "")
     text = _normalize_newlines(text)
     lines = text.split("\n") if "\n" in text else [text]
 
-    # Extract pPr and run template from cell paragraph styles (TST)
     cell_ppr = ""
     cell_rst_xml = ""
     if cell_para_styles:
@@ -1601,7 +1178,6 @@ def _build_cell_from_alias(cs_alias, text, col_width,
     else:
         cell = _minimal_cell(ns_w, escape_xml(text))
 
-    # Ensure tcPr with correct width
     tc_pr = cell.find(f"{{{ns_w}}}tcPr")
     if tc_pr is None:
         tc_pr = ET.Element(f"{{{ns_w}}}tcPr")
@@ -1617,15 +1193,7 @@ def _build_cell_from_alias(cs_alias, text, col_width,
 
 
 def _minimal_cell(ns_w, escaped_text):
-    """Create a minimal <w:tc> element with one paragraph.
-
-    Args:
-        ns_w: WordprocessingML namespace URI.
-        escaped_text: XML-escaped text content.
-
-    Returns:
-        Minimal cell Element.
-    """
+    """Create a minimal <w:tc> element with one paragraph."""
     cell = ET.Element(f"{{{ns_w}}}tc")
     tc_pr = ET.SubElement(cell, f"{{{ns_w}}}tcPr")
     ET.SubElement(tc_pr, f"{{{ns_w}}}tcW")
@@ -1642,22 +1210,7 @@ def _build_table_from_template(template, content,
                                paragraph_style_templates=None,
                                table_style_key="",
                                style_alias_map=None):
-    """Generate table XML from template using RS/CS style aliases.
-
-    Content format: 'row1col1 | row1col2\\nrow2col1 | row2col2'
-
-    Args:
-        template: TST dict with tbl_xml_template.
-        content: Table content in row|cell format.
-        row_style_aliases: RS alias per row.
-        cell_style_aliases_per_row: CS aliases per row per cell.
-        paragraph_style_templates: PST dict pool.
-        table_style_key: Table style key.
-        style_alias_map: Full alias map.
-
-    Returns:
-        Generated table XML string.
-    """
+    """Generate table XML from template using RS/CS style aliases."""
     row_style_aliases = row_style_aliases or []
     cell_style_aliases_per_row = cell_style_aliases_per_row or []
     paragraph_style_templates = paragraph_style_templates or {}
@@ -1678,16 +1231,13 @@ def _build_table_from_template(template, content,
 
         root = ET.fromstring(template["tbl_xml_template"])
 
-        # Remove existing template rows — we generate all rows below
         for old_tr in root.findall("w:tr", NAMESPACES):
             root.remove(old_tr)
 
-        # Rebuild tblGrid for actual column count
         total_width = _get_table_total_width(root)
         tbl_grid = root.find("w:tblGrid", NAMESPACES)
         if tbl_grid is not None:
             existing_gc = tbl_grid.findall("w:gridCol", NAMESPACES)
-            # If template has fewer columns, distribute evenly
             if len(existing_gc) != num_cols:
                 for gc in existing_gc:
                     tbl_grid.remove(gc)
@@ -1700,7 +1250,6 @@ def _build_table_from_template(template, content,
                     tbl_grid.append(gc)
         col_widths = _extract_column_widths(tbl_grid, num_cols, total_width)
 
-        # Build RS alias -> TST row_styles index mapping
         cst = template.get("cell_style_templates", {})
         tst_row_styles = template.get("row_styles", {})
         rs_to_tst_row = {}
@@ -1709,13 +1258,11 @@ def _build_table_from_template(template, content,
             key=lambda x: int(x) if x.isdigit() else 999,
         ):
             trpr = tst_row_styles[idx_key].get("tr_pr_xml_template", "")
-            # Find matching RS alias
             for rs_a in set(row_style_aliases):
                 if rs_a and rs_a not in rs_to_tst_row:
                     if style_alias_map.get(rs_a, "") == trpr:
                         rs_to_tst_row[rs_a] = idx_key
 
-        # Generate rows
         for row_idx, row_cells in enumerate(rows_content):
             new_row = ET.Element(f"{{{ns_w}}}tr")
 
@@ -1726,7 +1273,6 @@ def _build_table_from_template(template, content,
             )
             _apply_row_style(new_row, rs_alias, style_alias_map)
 
-            # Look up cell paragraph styles from TST
             tst_row_key = rs_to_tst_row.get(rs_alias)
             tst_cells = cst.get(tst_row_key, []) if tst_row_key else []
 
@@ -1775,36 +1321,17 @@ def _build_table_from_template(template, content,
         return template.get("tbl_xml_template", "")
 
 
-# -------------------------------------------------------------------
-# Main assembly loop
-# -------------------------------------------------------------------
-
 def assemble_document_xml(blocks, paragraph_style_templates,
                           table_style_templates,
                           style_alias_map):
-    """Assemble document.xml body content from modified blocks.
-
-    Main assembly loop: iterates blocks and builds XML body content,
-    handling replacements, insertions, deletions.
-
-    Args:
-        blocks: List of block dicts with edit markers.
-        paragraph_style_templates: PST dict pool.
-        table_style_templates: TST dict pool.
-        style_alias_map: Full alias map.
-
-    Returns:
-        Assembled XML body content string.
-    """
+    """Assemble document.xml body content from modified blocks."""
     body_parts = []
     block_id_to_parts_idx = {}
 
     for block in blocks:
-        # Skip deleted blocks
         if block.get("_deleted"):
             continue
 
-        # 1. Handle inserts_before
         for insert in block.get("_inserts_before", []):
             content = insert.get("content", "")
             if "\n" in content and "|" not in content:
@@ -1826,7 +1353,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                 if xml:
                     body_parts.append(xml)
 
-        # 2. Handle replacement or original
         if block.get("_replaced") and "_replacements" in block:
             replacements = block["_replacements"]
 
@@ -1836,19 +1362,16 @@ def assemble_document_xml(blocks, paragraph_style_templates,
             if is_table:
                 current_xml = block["xml"]
 
-                # Row deletions (reverse order)
                 for r_idx in sorted(
                     block.get("_row_deletions", []), reverse=True,
                 ):
                     current_xml = _table_delete_row(current_xml, r_idx)
 
-                # Column deletions (reverse order)
                 for c_idx in sorted(
                     block.get("_col_deletions", []), reverse=True,
                 ):
                     current_xml = _table_delete_column(current_xml, c_idx)
 
-                # Paragraph deletions (reverse order)
                 para_deletions = block.get("_para_deletions", [])
                 for pd in sorted(
                     para_deletions,
@@ -1860,11 +1383,9 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         pd["row_idx"], pd["col_idx"], pd["para_idx"],
                     )
 
-                # Look up TST for column inserts (font info)
                 tbl_style_key = block.get("style_key", "")
                 tbl_tst = table_style_templates.get(tbl_style_key, {})
 
-                # Column inserts after
                 col_inserts_after = block.get("_col_inserts_after", [])
                 for col_insert in sorted(
                     col_inserts_after, key=lambda x: x["col_idx"],
@@ -1890,7 +1411,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                             paragraph_style_templates=paragraph_style_templates,
                         )
 
-                # Column inserts before
                 col_inserts_before = block.get("_col_inserts_before", [])
                 for col_insert in sorted(
                     col_inserts_before, key=lambda x: x["col_idx"],
@@ -1916,7 +1436,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                             paragraph_style_templates=paragraph_style_templates,
                         )
 
-                # Apply replacements
                 for replacement in replacements:
                     original_target_id = replacement.get(
                         "original_target_id", "",
@@ -1950,7 +1469,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                             [c.strip() for c in content.split("|")]
                             if content else []
                         )
-                        # Simple text replacement in row cells
                         try:
                             root = ET.fromstring(current_xml)
                             xml_rows = root.findall(".//w:tr", NAMESPACES)
@@ -1976,14 +1494,12 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                 body_parts.append(current_xml)
 
             else:
-                # Regular paragraph REPLACE
                 block_id_to_parts_idx[block["id"]] = len(body_parts)
                 replacement = replacements[0]
 
                 style_key = replacement.get("style_key", "")
                 original_style_key = block.get("style_key", "")
 
-                # REPLACE: use original block style
                 effective_style_key = original_style_key
 
                 if effective_style_key not in paragraph_style_templates:
@@ -1995,7 +1511,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                 content = replacement["content"]
                 ns = NAMESPACES["w"]
 
-                # Check for images/drawings: use in-place replacement
                 original_xml = block.get("xml", "")
                 if _has_non_text_content(original_xml):
                     body_parts.append(
@@ -2004,8 +1519,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         ),
                     )
                 else:
-                    # Extract bookmarks from original paragraph
-                    # (TOC hyperlinks depend on these)
                     bk_starts, bk_ends = _extract_bookmarks_xml(
                         original_xml,
                     )
@@ -2028,7 +1541,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                         _append_paragraphs_from_content(
                             body_parts, template, content, ns,
                         )
-                        # Inject bookmarks into the first paragraph
                         if ((bk_starts or bk_ends)
                                 and len(body_parts) > start_idx):
                             body_parts[start_idx] = (
@@ -2038,11 +1550,9 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                                 )
                             )
         else:
-            # Unmodified original block
             block_id_to_parts_idx[block["id"]] = len(body_parts)
             body_parts.append(block["xml"])
 
-        # 3. Handle inserts_after
         for insert in block.get("_inserts_after", []):
             original_target_id = insert.get("original_target_id", "")
             insert_edit_unit = insert.get("edit_unit")
@@ -2059,7 +1569,6 @@ def assemble_document_xml(blocks, paragraph_style_templates,
             )
 
             if is_row_add:
-                # Row-level INSERT_AFTER
                 if row_add_match:
                     r_idx = int(row_add_match.group(1))
                 else:
@@ -2103,10 +1612,8 @@ def assemble_document_xml(blocks, paragraph_style_templates,
                     body_parts[-1] = modified_xml
 
             elif cell_para_match:
-                # Table cell paragraph insertion (not commonly hit from edits.json)
                 pass
             else:
-                # Normal block-level insertion
                 content = insert.get("content", "")
                 if "\n" in content and "|" not in content:
                     lines = [
@@ -2132,24 +1639,8 @@ def assemble_document_xml(blocks, paragraph_style_templates,
     return "".join(body_parts)
 
 
-# -------------------------------------------------------------------
-# wrap_document_body
-# -------------------------------------------------------------------
-
 def wrap_document_body(body_content, original_document_xml):
-    """Replace body content in document.xml preserving namespace declarations.
-
-    Uses regex to find <w:body>...</w:body> in the ORIGINAL document.xml,
-    replaces body content while preserving all namespace declarations
-    from the root element.
-
-    Args:
-        body_content: Assembled body XML content.
-        original_document_xml: Original document.xml content.
-
-    Returns:
-        Complete document.xml content string.
-    """
+    """Replace body content in document.xml preserving namespace declarations."""
     body_pattern = re.compile(
         r"(<w:body[^>]*>)[\s\S]*?(</w:body>)",
         re.IGNORECASE,
@@ -2166,30 +1657,14 @@ def wrap_document_body(body_content, original_document_xml):
     return original_document_xml
 
 
-# -------------------------------------------------------------------
-# save_document_xml
-# -------------------------------------------------------------------
-
 def save_document_xml(document_xml, extracted_path):
-    """Write assembled document.xml to the extracted directory.
-
-    Args:
-        document_xml: Assembled document XML content.
-        extracted_path: Path to extracted XMLs directory.
-
-    Returns:
-        Path to saved document.xml.
-    """
+    """Write assembled document.xml to the extracted directory."""
     output_path = os.path.join(extracted_path, "word", "document.xml")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(document_xml)
     return output_path
 
-
-# ===================================================================
-# CLI entry point
-# ===================================================================
 
 def main():
     if len(sys.argv) < 2:
@@ -2201,7 +1676,6 @@ def main():
     analysis_path = os.path.join(work_dir, "analysis.json")
     edits_path = os.path.join(work_dir, "edits.json")
 
-    # Validate inputs exist
     if not os.path.isfile(analysis_path):
         print(f"Error: {analysis_path} not found")
         sys.exit(1)
@@ -2209,7 +1683,6 @@ def main():
         print(f"Error: {edits_path} not found")
         sys.exit(1)
 
-    # Load inputs
     with open(analysis_path, "r", encoding="utf-8") as f:
         analysis = json.load(f)
 
@@ -2221,7 +1694,6 @@ def main():
         print("No edits to apply")
         sys.exit(0)
 
-    # Determine extracted path
     extracted_path = analysis.get("extracted_path", "")
     if not extracted_path:
         extracted_path = os.path.join(work_dir, "extracted")
@@ -2231,28 +1703,22 @@ def main():
         print(f"Error: {document_xml_path} not found")
         sys.exit(1)
 
-    # Read original document.xml
     with open(document_xml_path, "r", encoding="utf-8") as f:
         original_document_xml = f.read()
 
-    # Load template data
     paragraph_style_templates = analysis.get("paragraph_style_templates", {})
     table_style_templates = analysis.get("table_style_templates", {})
     style_alias_map = analysis.get("style_alias_map", {})
     blocks = analysis.get("blocks", [])
 
-    # Phase A: Generate new_blocks (simplified mapper)
     print(f"Phase A: Mapping {len(edits)} edits...")
     new_blocks = generate_new_blocks(edits, analysis)
     print(f"  Generated {len(new_blocks)} new blocks")
 
-    # Phase B: Assembly
     print("Phase B: Assembling document XML...")
 
-    # Apply mapping to blocks
     marked_blocks = apply_mapping_to_blocks(blocks, new_blocks)
 
-    # Assemble body content
     body_content = assemble_document_xml(
         marked_blocks,
         paragraph_style_templates,
@@ -2260,10 +1726,8 @@ def main():
         style_alias_map,
     )
 
-    # Wrap with document structure
     document_xml = wrap_document_body(body_content, original_document_xml)
 
-    # Save to file
     output_path = save_document_xml(document_xml, extracted_path)
 
     print(f"Applied {len(edits)} edits successfully")
